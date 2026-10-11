@@ -1,0 +1,11 @@
+name = "bot-finanzas"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+SPREADSHEET_ID = "1NG2w0XtOzvGh1qf303Dl6quRxC-zTwo0ssxyNndoKDA"
+TELEGRAM_CHAT_ID = "8600382894"
+TZ = "America/Bogota"
+
+[triggers]
+crons = ["0 12 1 * *", "*/30 * * * *"]
