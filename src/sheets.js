@@ -124,14 +124,12 @@ export async function appendMovimiento(env, mov) {
   return fila;
 }
 
-// ---------- C.6 OPTIMIZACIONES ----------
+// ---------- OPTIMIZACIONES C.6 ----------
 
-// Devuelve la próxima fila libre en MOVIMIENTOS
 export async function obtenerProximaFila(env) {
   return obtenerSiguienteFila(env);
 }
 
-// Escribe varios movimientos en UNA sola llamada (batch)
 export async function appendMovimientosBatch(env, movs) {
   if (movs.length === 0) return [];
   const filaIni = await obtenerSiguienteFila(env);
@@ -163,6 +161,33 @@ export async function appendMovimientosBatch(env, movs) {
 
   return filas;
 }
+
+// ---------- BÚSQUEDA POR ID ----------
+
+// Busca la fila física dado un ID (columna A)
+export async function buscarFilaPorId(env, idBuscado) {
+  const data = await sheetsRequest(
+    env,
+    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
+  );
+  const rows = data.values || [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || !r[0]) continue;
+    if (String(r[0]).trim() === String(idBuscado).trim()) {
+      return i + 1;
+    }
+  }
+  return null;
+}
+
+// Devuelve el ID (columna A) de una fila física
+export async function obtenerIdDeFila(env, fila) {
+  const r = await leerMovimientoPorFila(env, fila);
+  return r ? String(r[0] || '').trim() : '';
+}
+
+// ---------- ACTUALIZACIONES ----------
 
 export async function actualizarRubro(env, fila, rubro) {
   return sheetsRequest(env, `/values/MOVIMIENTOS!G${fila}?valueInputOption=USER_ENTERED`, {
@@ -303,6 +328,40 @@ export async function leerPresupuestoMes(env, año, mesNum) {
   return resultado;
 }
 
+// ---------- C.5: ESCRIBIR PRESUPUESTO ----------
+
+// Guarda o actualiza un rubro del presupuesto para un mes específico
+export async function guardarPresupuesto(env, año, mesNum, rubro, monto) {
+  const data = await sheetsRequest(
+    env,
+    `/values/PRESUPUESTO!A:D?valueRenderOption=FORMATTED_VALUE`
+  );
+  const rows = data.values || [];
+  let filaExistente = null;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    if (Number(r[0]) === año && Number(r[1]) === mesNum && r[2] === rubro) {
+      filaExistente = i + 1;
+      break;
+    }
+  }
+  if (filaExistente) {
+    await sheetsRequest(env, `/values/PRESUPUESTO!D${filaExistente}?valueInputOption=USER_ENTERED`, {
+      method: 'PUT',
+      body: JSON.stringify({ values: [[monto]] }),
+    });
+    return filaExistente;
+  }
+  // Nueva fila
+  const fila = rows.length + 1;
+  await sheetsRequest(env, `/values/PRESUPUESTO!A${fila}:D${fila}?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    body: JSON.stringify({ values: [[año, mesNum, rubro, monto]] }),
+  });
+  return fila;
+}
+
 export async function leerConfig(env) {
   const data = await sheetsRequest(env, `/values/CONFIG!A1:B40`);
   return data.values || [];
@@ -344,7 +403,6 @@ export async function listarBorradores(env) {
   return resultado;
 }
 
-// Solo los borradores que vinieron de correo (fuente === 'correo')
 export async function listarBorradoresDeCorreo(env) {
   const todos = await listarBorradores(env);
   return todos.filter(({ data: r }) => (r[11] || '').toLowerCase() === 'correo');
@@ -511,5 +569,39 @@ export async function actualizarIdCorreo(env, fila, idCorreo) {
   return sheetsRequest(env, `/values/MOVIMIENTOS!N${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
     body: JSON.stringify({ values: [[idCorreo]] }),
+  });
+}
+
+// ---------- C.4: ALERTAS ----------
+
+// Devuelve un Set con las alertas ya enviadas este mes: "YYYY-MM:Rubro:Umbral"
+export async function leerAlertasEnviadas(env, mes) {
+  try {
+    const data = await sheetsRequest(
+      env,
+      `/values/ALERTAS!A:D?valueRenderOption=FORMATTED_VALUE`
+    );
+    const rows = data.values || [];
+    const set = new Set();
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r[0]) continue;
+      if (String(r[0]) !== mes) continue;
+      set.add(`${String(r[0])}:${r[1]}:${r[2]}`);
+    }
+    return set;
+  } catch (e) {
+    if (String(e.message).includes('Unable to parse range')) return new Set();
+    throw e;
+  }
+}
+
+export async function guardarAlerta(env, mes, rubro, umbral) {
+  const fecha = new Date().toISOString().slice(0, 10);
+  const data = await sheetsRequest(env, `/values/ALERTAS!A:D`);
+  const fila = (data.values || []).length + 1;
+  await sheetsRequest(env, `/values/ALERTAS!A${fila}:D${fila}?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    body: JSON.stringify({ values: [[mes, rubro, umbral, fecha]] }),
   });
 }

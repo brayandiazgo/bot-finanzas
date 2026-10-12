@@ -134,10 +134,11 @@ export function tecladoListado(offset, total) {
 export function tecladoBorradores(filas) {
   const botones = [];
   for (const b of filas) {
+    const idMostrar = b.data?.[0] || b.fila;
     botones.push([
-      { text: `✅ #${b.fila}`, callback_data: `ok:${b.fila}` },
-      { text: `✏️ #${b.fila}`, callback_data: `volver:${b.fila}` },
-      { text: `🗑️ #${b.fila}`, callback_data: `cancelar:${b.fila}` },
+      { text: `✅ #${idMostrar}`, callback_data: `ok:${b.fila}` },
+      { text: `✏️ #${idMostrar}`, callback_data: `volver:${b.fila}` },
+      { text: `🗑️ #${idMostrar}`, callback_data: `cancelar:${b.fila}` },
     ]);
   }
   return { inline_keyboard: botones };
@@ -146,9 +147,10 @@ export function tecladoBorradores(filas) {
 export function tecladoRevisar(filas) {
   const botones = [];
   for (const b of filas) {
+    const idMostrar = b.data?.[0] || b.fila;
     botones.push([
-      { text: `✏️ #${b.fila}`, callback_data: `volver:${b.fila}` },
-      { text: `🗑️ #${b.fila}`, callback_data: `cancelar:${b.fila}` },
+      { text: `✏️ #${idMostrar}`, callback_data: `volver:${b.fila}` },
+      { text: `🗑️ #${idMostrar}`, callback_data: `cancelar:${b.fila}` },
     ]);
   }
   botones.push([{ text: '➡️ Siguientes', callback_data: 'revisar_siguientes' }]);
@@ -189,13 +191,13 @@ export function tecladoCorreoIndividual(fila) {
   };
 }
 
-export function tecladoResumenCorreos(cantidad) {
+// ---------- C.5: TECLADO PARA APLICAR PRESUPUESTO ----------
+
+export function tecladoAplicarPresupuesto(año, mesNum) {
   return {
     inline_keyboard: [[
-      { text: '✅ Confirmar todos', callback_data: 'correos_confirmar_todos' },
-      { text: '🔍 Ver uno por uno', callback_data: 'correos_ver_individual' },
-    ], [
-      { text: '❌ Ignorar todos', callback_data: 'correos_ignorar_todos' },
+      { text: '✅ Aplicar sugerencia', callback_data: `aplicar_presupuesto:${año}:${mesNum}` },
+      { text: '❌ Ignorar', callback_data: 'ignorar_presupuesto' },
     ]],
   };
 }

@@ -6,7 +6,8 @@ import {
   tecladoBorrarConfirmar, tecladoListado,
   tecladoConfirmarEliminar, tecladoBorradores,
   tecladoRevisar,
-  tecladoCorreos, tecladoCorreoIndividual, tecladoResumenCorreos,
+  tecladoCorreos, tecladoCorreoIndividual,
+  tecladoAplicarPresupuesto,
 } from './telegram.js';
 import {
   appendMovimiento, appendMovimientosBatch, obtenerProximaFila,
@@ -20,6 +21,9 @@ import {
   obtenerMsgIdsBorradores,
   leerAprendizaje, guardarAprendizaje, reemplazarAprendizaje,
   leerIdsCorreosExistentes, actualizarIdCorreo,
+  buscarFilaPorId,
+  leerAlertasEnviadas, guardarAlerta,
+  guardarPresupuesto,
 } from './sheets.js';
 import {
   contarCorreosBancolombia, listarCorreosBancolombia, leerCorreo, verPrimerCorreo,
@@ -228,6 +232,121 @@ async function borrarMensajesDeBorradoresViejos(env, chatId) {
   }
 }
 
+// ---------- C.4: ALERTAS ----------
+
+async function verificarAlertas(env, chatId) {
+  try {
+    const hoy = hoyColombia();
+    const año = Number(hoy.slice(0, 4));
+    const mesNum = Number(hoy.slice(5, 7));
+    const mesIni = hoy.slice(0, 7) + '-01';
+    const mesKey = hoy.slice(0, 7);
+
+    const rows = await leerMovimientos(env, mesIni, hoy, true);
+    const porRubro = {};
+    for (const { data: r } of rows) {
+      if (r[10] !== 'Gasto') continue;
+      const rubro = r[6] || 'Otro';
+      porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(parsearValor(r[7]));
+    }
+
+    const presupuesto = await leerPresupuestoMes(env, año, mesNum);
+    const alertasEnviadas = await leerAlertasEnviadas(env, mesKey);
+
+    for (const p of presupuesto) {
+      if (p.monto <= 0) continue;
+      const gastado = porRubro[p.rubro] || 0;
+      const pct = (gastado / p.monto) * 100;
+
+      for (const umbral of [80, 100]) {
+        if (pct >= umbral) {
+          const key = `${mesKey}:${p.rubro}:${umbral}`;
+          if (!alertasEnviadas.has(key)) {
+            const icono = umbral === 100 ? '🚨' : '⚠️';
+            const nivel = umbral === 100 ? '<b>EXCEDIDO</b>' : 'cerca del límite';
+            await enviar(env, chatId,
+              `${icono} <b>Alerta de presupuesto</b>\n\n` +
+              `<b>${p.rubro}</b>: ${nivel}\n` +
+              `Gastado: $${fmt(gastado)} de $${fmt(p.monto)} (${pct.toFixed(0)}%)\n` +
+              (umbral === 100
+                ? `Excedido en $${fmt(gastado - p.monto)}`
+                : `Disponible: $${fmt(p.monto - gastado)}`)
+            );
+            await guardarAlerta(env, mesKey, p.rubro, umbral);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.log('[ALERTAS] Error:', e.message);
+  }
+}
+
+// ---------- C.5: ANÁLISIS MENSUAL ----------
+
+async function calcularSugerenciaMensual(env) {
+  const hoy = hoyColombia();
+  const añoHoy = Number(hoy.slice(0, 4));
+  const mesHoy = Number(hoy.slice(5, 7));
+
+  // Próximo mes
+  let añoProx = añoHoy;
+  let mesProx = mesHoy + 1;
+  if (mesProx > 12) { mesProx = 1; añoProx += 1; }
+
+  // Calcular gastos de los últimos 3 meses (incluyendo el actual)
+  const meses = [];
+  for (let i = 0; i < 3; i++) {
+    let m = mesHoy - i;
+    let y = añoHoy;
+    while (m <= 0) { m += 12; y -= 1; }
+    meses.push({ año: y, mes: m });
+  }
+
+  const acumulado = {};
+  for (const { año, mes } of meses) {
+    const mesIni = `${año}-${String(mes).padStart(2, '0')}-01`;
+    const ultimoDia = new Date(año, mes, 0).getDate();
+    const mesFin = `${año}-${String(mes).padStart(2, '0')}-${String(ultimoDia).padStart(2, '0')}`;
+    const finEfectivo = mesFin > hoy ? hoy : mesFin;
+
+    const rows = await leerMovimientos(env, mesIni, finEfectivo, true);
+    const mesesConDatos = new Set();
+    for (const { data: r } of rows) {
+      if (r[10] !== 'Gasto') continue;
+      const rubro = r[6] || 'Otro';
+      if (!acumulado[rubro]) acumulado[rubro] = { total: 0, meses: new Set() };
+      acumulado[rubro].total += Math.abs(parsearValor(r[7]));
+      acumulado[rubro].meses.add(`${año}-${mes}`);
+    }
+    mesesConDatos.add(`${año}-${mes}`);
+  }
+
+  const sugerencia = [];
+  for (const [rubro, data] of Object.entries(acumulado)) {
+    const n = data.meses.size || 1;
+    const promedio = data.total / n;
+    // Redondear a miles
+    const sug = Math.round(promedio / 1000) * 1000;
+    if (sug > 0) sugerencia.push({ rubro, promedio: sug });
+  }
+
+  sugerencia.sort((a, b) => b.promedio - a.promedio);
+  return { añoProx, mesProx, sugerencia };
+}
+
+function mensajeSugerencia(data) {
+  const total = data.sugerencia.reduce((a, s) => a + s.promedio, 0);
+  let msg = `📊 <b>Análisis mensual</b>\n\n`;
+  msg += `Sugerencia de presupuesto para <b>${MESES[data.mesProx - 1]} ${data.añoProx}</b>\n`;
+  msg += `(basado en promedio de los últimos 3 meses)\n\n`;
+  for (const s of data.sugerencia) {
+    msg += `• ${s.rubro}: $${fmt(s.promedio)}\n`;
+  }
+  msg += `\n<b>Total: $${fmt(total)}</b>`;
+  return msg;
+}
+
 // ---------- CÁLCULO DE RESUMEN ----------
 
 async function calcularResumen(env) {
@@ -356,7 +475,8 @@ async function handleStart(env, chatId) {
     `/aprendizaje — ver la tabla de aprendizaje\n` +
     `/testcorreos — cuántos correos hay etiquetados\n` +
     `/vercorreo — ver el body crudo del último correo\n` +
-    `/testparser — analizar los últimos 10 correos\n\n` +
+    `/testparser — analizar los últimos 10 correos\n` +
+    `/sugerencia — análisis mensual ahora mismo\n\n` +
     `/ayuda`
   );
 }
@@ -399,6 +519,9 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     tipo: 'Gasto', fuente: 'manual', estado: 'pendiente',
   });
 
+  const r = await leerMovimientoPorFila(env, fila);
+  const id = String(r?.[0] || fila).trim();
+
   let lineaFuente;
   if (fuente === 'diccionario') {
     lineaFuente = `📚 Categorizado con diccionario`;
@@ -409,7 +532,7 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
   }
 
   const msgResp = await enviar(env, chatId,
-    `🕒 <b>Borrador</b> (fila ${fila})\n` +
+    `🕒 <b>Borrador</b> (ID ${id})\n` +
     textoBorrador(fecha, rubro, -monto, desc, medioFinal) +
     `\n\n${lineaFuente}` +
     `\n\nPresiona ✅ para guardar:`,
@@ -556,7 +679,14 @@ async function handleRubro(env, chatId, busqueda) {
     if (r[6] !== rubro) continue;
     const valor = Math.abs(parsearValor(r[7]));
     gastado += valor;
-    movs.push({ fila, fecha: normalizarFecha(r[1]), valor, desc: r[8] || '', medio: r[9] || 'Efectivo' });
+    movs.push({
+      fila,
+      id: String(r[0] || '').trim(),
+      fecha: normalizarFecha(r[1]),
+      valor,
+      desc: r[8] || '',
+      medio: r[9] || 'Efectivo',
+    });
   }
 
   const presupuesto = await leerPresupuestoMes(env, año, mesNum);
@@ -586,7 +716,7 @@ async function handleRubro(env, chatId, busqueda) {
     msg += `\n<b>Movimientos (${movs.length}):</b>\n`;
     const ultimos = movs.slice(-10).reverse();
     for (const m of ultimos) {
-      msg += `#${m.fila} ${m.fecha} — $${fmt(m.valor)} ${m.desc} <i>(${m.medio})</i>\n`;
+      msg += `#${m.id} ${m.fecha} — $${fmt(m.valor)} ${m.desc} <i>(${m.medio})</i>\n`;
     }
     if (movs.length > 10) {
       msg += `\n<i>... y ${movs.length - 10} más</i>`;
@@ -710,13 +840,23 @@ async function handleHoy(env, chatId) {
   const hoy = hoyColombia();
   const rows = await leerMovimientos(env, hoy, hoy, true);
   if (rows.length === 0) return enviar(env, chatId, '📭 Sin movimientos hoy.');
+
+  // Movimientos con fecha de hoy
+  const conFechaHoy = rows;
+  // Movimientos registrados HOY (aunque fecha sea otra) → leer la hoja completa
+  // pero no podemos saber la fecha de registro fácilmente, así que los traemos del listado general
+  // Solución: filtramos por ID o por la última corrida
+
   let msg = `📅 <b>Hoy (${hoy})</b>\n\n`;
-  for (const { fila, data: r } of rows) {
+  msg += `<b>Con fecha de hoy:</b>\n`;
+  for (const { data: r } of conFechaHoy) {
     const valor = parsearValor(r[7]);
     const signo = valor < 0 ? '➖' : '➕';
     const medio = r[9] || 'Efectivo';
-    msg += `#${fila} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
+    const id = String(r[0] || '').trim();
+    msg += `#${id} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
   }
+
   return enviar(env, chatId, msg);
 }
 
@@ -772,14 +912,15 @@ async function handleListar(env, chatId, offset = 0) {
   const { total, items } = await listarMovimientos(env, 10, offset, false);
   if (total === 0) return enviar(env, chatId, '📭 No hay movimientos confirmados.');
   let msg = `📋 <b>Movimientos recientes</b> (${offset + 1}-${Math.min(offset + 10, total)} de ${total})\n\n`;
-  for (const { fila, data: r } of items) {
+  for (const { data: r } of items) {
     const valor = parsearValor(r[7]);
     const signo = valor < 0 ? '➖' : '➕';
     const fecha = normalizarFecha(r[1]);
     const medio = r[9] || 'Efectivo';
-    msg += `<b>#${fila}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
+    const id = String(r[0] || '').trim();
+    msg += `<b>#${id}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
   }
-  msg += `\nUsa /editar N o /borrar N para modificar un movimiento.`;
+  msg += `\nUsa /editar ID o /borrar ID para modificar un movimiento.`;
   return enviar(env, chatId, msg, { reply_markup: tecladoListado(offset, total) });
 }
 
@@ -791,23 +932,26 @@ async function handleBorradores(env, chatId) {
   for (const { fila, data: r } of borradores) {
     const valor = parsearValor(r[7]);
     const fecha = normalizarFecha(r[1]);
-    msg += `<b>#${fila}</b> ${fecha} ➖ $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'})</i>\n`;
+    const id = String(r[0] || fila).trim();
+    msg += `<b>#${id}</b> ${fecha} ➖ $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'})</i>\n`;
   }
   msg += `\n✅ Guardar · ✏️ Editar · 🗑️ Descartar`;
 
   return enviar(env, chatId, msg, { reply_markup: tecladoBorradores(borradores) });
 }
 
-async function handleEditar(env, chatId, fila) {
+async function handleEditar(env, chatId, idBuscado) {
+  const fila = await buscarFilaPorId(env, idBuscado);
+  if (!fila) return enviar(env, chatId, `❌ No encontré el ID ${idBuscado}.`);
   const r = await leerMovimientoPorFila(env, fila);
-  if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
-  if (r[10] !== 'Gasto') return enviar(env, chatId, `❌ Solo puedo editar gastos. Esta fila es un ${r[10]}.`);
+  if (!r) return enviar(env, chatId, `❌ No encontré el ID ${idBuscado}.`);
+  if (r[10] !== 'Gasto') return enviar(env, chatId, `❌ Solo puedo editar gastos. Este es un ${r[10]}.`);
 
   await actualizarEstado(env, fila, 'pendiente');
   await borrarMensajesDeBorradoresViejos(env, chatId);
 
   const msgResp = await enviar(env, chatId,
-    `✏️ <b>Editando fila ${fila}</b>\n\n` +
+    `✏️ <b>Editando #${idBuscado}</b>\n\n` +
     textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], r[9]),
     { reply_markup: tecladoBorradorEdicion(fila) }
   );
@@ -818,14 +962,16 @@ async function handleEditar(env, chatId, fila) {
   return msgResp;
 }
 
-async function handleBorrar(env, chatId, fila) {
+async function handleBorrar(env, chatId, idBuscado) {
+  const fila = await buscarFilaPorId(env, idBuscado);
+  if (!fila) return enviar(env, chatId, `❌ No encontré el ID ${idBuscado}.`);
   const r = await leerMovimientoPorFila(env, fila);
-  if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
+  if (!r) return enviar(env, chatId, `❌ No encontré el ID ${idBuscado}.`);
   const valor = parsearValor(r[7]);
   const fecha = normalizarFecha(r[1]);
   return enviar(env, chatId,
     `⚠️ ¿Borrar este movimiento?\n\n` +
-    `<b>#${fila}</b> ${fecha}\n$${fmt(Math.abs(valor))} — ${r[8] || ''}\nRubro: <i>${r[6]}</i>\nMedio: <i>${r[9]}</i>`,
+    `<b>#${idBuscado}</b> ${fecha}\n$${fmt(Math.abs(valor))} — ${r[8] || ''}\nRubro: <i>${r[6]}</i>\nMedio: <i>${r[9]}</i>`,
     { reply_markup: tecladoBorrarConfirmar(fila) }
   );
 }
@@ -834,10 +980,10 @@ async function handleValor(env, chatId, texto) {
   const m = texto.match(/^(\d+)\s+([\d.,]+)$/);
   if (!m) {
     return enviar(env, chatId,
-      `❌ Formato incorrecto.\n\nUso: <code>/valor N MONTO</code>\nEjemplo: <code>/valor 574 5000</code>\n\nEl monto solo puede tener números.`
+      `❌ Formato incorrecto.\n\nUso: <code>/valor ID MONTO</code>\nEjemplo: <code>/valor 577 5000</code>\n\nEl monto solo puede tener números.`
     );
   }
-  const fila = Number(m[1]);
+  const idBuscado = m[1];
   const nuevoValor = Number(m[2].replace(/[.,]/g, ''));
 
   if (nuevoValor <= 0) return enviar(env, chatId, '❌ El monto debe ser mayor a 0.');
@@ -847,8 +993,9 @@ async function handleValor(env, chatId, texto) {
     );
   }
 
+  const fila = await buscarFilaPorId(env, idBuscado);
+  if (!fila) return enviar(env, chatId, `❌ No encontré el ID ${idBuscado}.`);
   const r = await leerMovimientoPorFila(env, fila);
-  if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
 
   const signo = r[10] === 'Gasto' ? -1 : 1;
   await actualizarValor(env, fila, signo * nuevoValor);
@@ -858,7 +1005,7 @@ async function handleValor(env, chatId, texto) {
       const rNuevo = await leerMovimientoPorFila(env, fila);
       if (rNuevo && rNuevo[12] === 'pendiente') {
         await editarMensaje(env, chatId, Number(r[15]),
-          `🕒 <b>Borrador</b> (fila ${fila})\n` +
+          `🕒 <b>Borrador</b> (ID ${idBuscado})\n` +
           textoBorrador(rNuevo[1], rNuevo[6], parsearValor(rNuevo[7]), rNuevo[8], rNuevo[9]) +
           `\n\nPresiona ✅ para guardar:`,
           { reply_markup: tecladoBorrador(fila) }
@@ -867,20 +1014,23 @@ async function handleValor(env, chatId, texto) {
     } catch (e) { console.log('No pude refrescar:', e.message); }
   }
 
-  return enviar(env, chatId, `✅ Fila ${fila} → valor <b>$${fmt(nuevoValor)}</b>`);
+  return enviar(env, chatId, `✅ ID ${idBuscado} → valor <b>$${fmt(nuevoValor)}</b>`);
 }
 
 async function handleDesc(env, chatId, texto) {
   const m = texto.match(/^(\d+)\s+(.+)$/);
   if (!m) {
     return enviar(env, chatId,
-      `❌ Formato incorrecto.\n\nUso: <code>/desc N TEXTO</code>\nEjemplo: <code>/desc 574 almuerzo con Juan</code>`
+      `❌ Formato incorrecto.\n\nUso: <code>/desc ID TEXTO</code>\nEjemplo: <code>/desc 577 almuerzo con Juan</code>`
     );
   }
-  const fila = Number(m[1]);
+  const idBuscado = m[1];
   const nuevaDesc = m[2];
+
+  const fila = await buscarFilaPorId(env, idBuscado);
+  if (!fila) return enviar(env, chatId, `❌ No encontré el ID ${idBuscado}.`);
   const r = await leerMovimientoPorFila(env, fila);
-  if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
+
   await actualizarDescripcion(env, fila, nuevaDesc);
 
   if (r[15]) {
@@ -888,7 +1038,7 @@ async function handleDesc(env, chatId, texto) {
       const rNuevo = await leerMovimientoPorFila(env, fila);
       if (rNuevo && rNuevo[12] === 'pendiente') {
         await editarMensaje(env, chatId, Number(r[15]),
-          `🕒 <b>Borrador</b> (fila ${fila})\n` +
+          `🕒 <b>Borrador</b> (ID ${idBuscado})\n` +
           textoBorrador(rNuevo[1], rNuevo[6], parsearValor(rNuevo[7]), rNuevo[8], rNuevo[9]) +
           `\n\nPresiona ✅ para guardar:`,
           { reply_markup: tecladoBorrador(fila) }
@@ -897,7 +1047,7 @@ async function handleDesc(env, chatId, texto) {
     } catch (e) { console.log('No pude refrescar:', e.message); }
   }
 
-  return enviar(env, chatId, `✅ Fila ${fila} → "${nuevaDesc}"`);
+  return enviar(env, chatId, `✅ ID ${idBuscado} → "${nuevaDesc}"`);
 }
 
 async function handleRevisar(env, chatId, offset = 0) {
@@ -925,18 +1075,19 @@ async function handleRevisar(env, chatId, offset = 0) {
   const total = sospechosos.length;
 
   let msg = `🔍 <b>Movimientos a revisar</b> (${offset + 1}-${Math.min(offset + 5, total)} de ${total})\n\n`;
-  for (const { fila, data: r } of items) {
+  for (const { data: r } of items) {
     const valor = parsearValor(r[7]);
     const signo = valor < 0 ? '➖' : '➕';
     const fecha = normalizarFecha(r[1]);
     const medio = r[9] || 'Efectivo';
     const rubro = r[6] || '?';
     const desc = r[8] || '(sin descripción)';
-    msg += `<b>#${fila}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))}\n`;
+    const id = String(r[0] || '').trim();
+    msg += `<b>#${id}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))}\n`;
     msg += `   "${desc}"\n`;
     msg += `   Rubro actual: <i>${rubro}</i> · ${medio}\n\n`;
   }
-  msg += `Toca ✏️ #N para corregir el rubro, 🗑️ #N para eliminarla.`;
+  msg += `Toca ✏️ #ID para corregir el rubro, 🗑️ #ID para eliminarla.`;
 
   return enviar(env, chatId, msg, { reply_markup: tecladoRevisar(items) });
 }
@@ -1027,6 +1178,17 @@ async function handleVerAprendizaje(env, chatId) {
   }
 
   return enviar(env, chatId, msg);
+}
+
+async function handleSugerencia(env, chatId) {
+  await enviar(env, chatId, '📊 Calculando análisis mensual...');
+  const data = await calcularSugerenciaMensual(env);
+  if (data.sugerencia.length === 0) {
+    return enviar(env, chatId, '📭 No hay suficientes datos para sugerir un presupuesto.');
+  }
+  return enviar(env, chatId, mensajeSugerencia(data), {
+    reply_markup: tecladoAplicarPresupuesto(data.añoProx, data.mesProx),
+  });
 }
 
 function limpiarHTML(html) {
@@ -1157,7 +1319,6 @@ async function handleCorreos(env, chatId) {
 
     const limiteMs = Date.now() - DIAS_MAX_ANTIGUEDAD * 24 * 60 * 60 * 1000;
 
-    // 1) Leer correos
     const candidatos = [];
     let ignoradosPorViejos = 0;
     for (const m of listaGmail) {
@@ -1179,7 +1340,6 @@ async function handleCorreos(env, chatId) {
       if (candidatos.length >= MAX_POR_CORRIDA) break;
     }
 
-    // 2) Sin candidatos → avisar y salir
     if (candidatos.length === 0) {
       if (chatId) {
         let msgVacio = '✅ No hay correos nuevos para registrar.';
@@ -1191,7 +1351,6 @@ async function handleCorreos(env, chatId) {
       return;
     }
 
-    // 3) Cargar aprendizaje UNA vez
     const aprend = await leerAprendizaje(env);
 
     function categorizarConCache(desc) {
@@ -1206,7 +1365,6 @@ async function handleCorreos(env, chatId) {
       return { rubro: 'Otro', fuente: 'ninguna' };
     }
 
-    // 4) Armar batch
     const nominas = candidatos.filter(c => c.esNomina);
     const pendientes = candidatos.filter(c => !c.esNomina);
     const movsBatch = [];
@@ -1240,10 +1398,8 @@ async function handleCorreos(env, chatId) {
       });
     }
 
-    // 5) Escribir todo en UNA sola llamada
     const filas = await appendMovimientosBatch(env, movsBatch);
 
-    // 6) Preparar info de borradores
     const borradoresInfo = [];
     for (let i = 0; i < pendientes.length; i++) {
       const c = pendientes[i];
@@ -1257,10 +1413,8 @@ async function handleCorreos(env, chatId) {
       });
     }
 
-    // 7) Si no hay chatId (cron silencioso), salir
     if (!chatId) return;
 
-    // 8) Armar mensaje
     let msg = `📧 <b>${candidatos.length} correo(s) nuevo(s)</b>\n\n`;
     if (nominas.length > 0) {
       msg += `💼 Registré ${nominas.length} nómina(s) automáticamente.\n\n`;
@@ -1276,10 +1430,9 @@ async function handleCorreos(env, chatId) {
       msg += `\nConfirma con ✅ o revisa uno por uno.`;
       await enviar(env, chatId, msg, {
         reply_markup: tecladoCorreos(borradoresInfo),
-        disable_web_page_preview: true,
       });
     } else if (nominas.length > 0 || ignoradosPorViejos > 0) {
-      await enviar(env, chatId, msg, { disable_web_page_preview: true });
+      await enviar(env, chatId, msg);
     }
   } catch (e) {
     console.log('[CORREOS] Error general:', e.message, e.stack);
@@ -1301,6 +1454,7 @@ async function handleCorreosConfirmarTodos(env, chatId, messageId) {
       count++;
     }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    await verificarAlertas(env, chatId);
     return enviar(env, chatId, `✅ Confirmados ${count} movimiento(s) de correo. Revisa /hoy.`);
   } catch (e) {
     console.log('[CORREOS_CONFIRMAR] Error:', e.message);
@@ -1333,13 +1487,12 @@ async function handleCorreosVerIndividual(env, chatId, messageId) {
       try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
       return enviar(env, chatId, '📭 No hay borradores de correo pendientes.');
     }
-    // Borramos el mensaje con los botones "confirmar/ignorar todos"
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    // Mandamos un borrador individual por cada correo
     for (const { fila, data: r } of borradores) {
       const valor = parsearValor(r[7]);
+      const id = String(r[0] || fila).trim();
       const msg =
-        `🕒 <b>Borrador</b> (fila ${fila})\n` +
+        `🕒 <b>Borrador</b> (ID ${id})\n` +
         textoBorrador(r[1], r[6], valor, r[8], r[9]) +
         `\n\nPresiona ✅ para guardar:`;
       const resp = await enviar(env, chatId, msg, {
@@ -1382,6 +1535,7 @@ async function handleMensaje(env, msg) {
   if (texto.startsWith('/listar')) return handleListar(env, chatId, 0);
   if (texto.startsWith('/borradores')) return handleBorradores(env, chatId);
   if (texto.startsWith('/correos')) return handleCorreos(env, chatId);
+  if (texto.startsWith('/sugerencia')) return handleSugerencia(env, chatId);
   if (texto.startsWith('/revisar')) {
     const m = texto.match(/^\/revisar\s+(\d+)/);
     const offset = m ? Number(m[1]) : 0;
@@ -1396,17 +1550,17 @@ async function handleMensaje(env, msg) {
   if (texto.startsWith('/editar')) {
     const m = texto.match(/^\/editar\s+(\d+)/);
     if (!m) return enviar(env, chatId,
-      `❌ Falta el número de fila.\n\nUso: <code>/editar N</code>\nEjemplo: <code>/editar 574</code>\n\nUsa /listar para ver los números de fila.`
+      `❌ Falta el ID.\n\nUso: <code>/editar ID</code>\nEjemplo: <code>/editar 577</code>\n\nUsa /listar para ver los IDs.`
     );
-    return handleEditar(env, chatId, Number(m[1]));
+    return handleEditar(env, chatId, m[1]);
   }
 
   if (texto.startsWith('/borrar')) {
     const m = texto.match(/^\/borrar\s+(\d+)/);
     if (!m) return enviar(env, chatId,
-      `❌ Falta el número de fila.\n\nUso: <code>/borrar N</code>\nEjemplo: <code>/borrar 574</code>\n\nUsa /listar para ver los números de fila.`
+      `❌ Falta el ID.\n\nUso: <code>/borrar ID</code>\nEjemplo: <code>/borrar 577</code>\n\nUsa /listar para ver los IDs.`
     );
-    return handleBorrar(env, chatId, Number(m[1]));
+    return handleBorrar(env, chatId, m[1]);
   }
 
   if (texto.startsWith('/valor')) {
@@ -1453,9 +1607,12 @@ async function handleCallback(env, cq) {
     const desc = r?.[8] || '';
     const rubro = r?.[6] || '';
     const medio = r?.[9] || '';
+    const id = String(r?.[0] || fila).trim();
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    // Verificar alertas después de guardar
+    await verificarAlertas(env, chatId);
     return enviar(env, chatId,
-      `✅ <b>Guardado</b> (fila ${fila})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
+      `✅ <b>Guardado</b> (ID ${id})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
     );
   }
 
@@ -1463,22 +1620,23 @@ async function handleCallback(env, cq) {
     const fila = Number(params[0]);
     try { await borrarFila(env, fila); } catch (e) { /* noop */ }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    return enviar(env, chatId, `🗑️ Cancelado (fila ${fila} eliminada)`);
+    return enviar(env, chatId, `🗑️ Cancelado`);
   }
 
   if (accion === 'eliminar') {
     const fila = Number(params[0]);
     try { await borrarFila(env, fila); } catch (e) { /* noop */ }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    return enviar(env, chatId, `🗑️ Fila ${fila} eliminada`);
+    return enviar(env, chatId, `🗑️ Eliminado`);
   }
 
   if (accion === 'confirmar_eliminar') {
     const fila = Number(params[0]);
     const r = await leerMovimientoPorFila(env, fila);
-    if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré la fila ${fila}.`);
+    if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré.`);
+    const id = String(r[0] || fila).trim();
     return editarMensaje(env, chatId, messageId,
-      `⚠️ <b>¿Seguro que quieres eliminar la fila ${fila}?</b>\n\n` +
+      `⚠️ <b>¿Seguro que quieres eliminar #${id}?</b>\n\n` +
       `<b>$${fmt(Math.abs(parsearValor(r[7])))}</b> — ${r[8] || ''}\nRubro: <i>${r[6]}</i>\n\nEsto no se puede deshacer.`,
       { reply_markup: tecladoConfirmarEliminar(fila) }
     );
@@ -1489,7 +1647,7 @@ async function handleCallback(env, cq) {
     await actualizarEstado(env, fila, 'confirmado');
     try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    return enviar(env, chatId, `↩️ Fila ${fila} sin cambios`);
+    return enviar(env, chatId, `↩️ Sin cambios`);
   }
 
   if (accion === 'rubro') {
@@ -1508,8 +1666,10 @@ async function handleCallback(env, cq) {
 
   if (accion === 'valor') {
     const fila = Number(params[0]);
+    const r = await leerMovimientoPorFila(env, fila);
+    const id = String(r?.[0] || fila).trim();
     return editarMensaje(env, chatId, messageId,
-      `💲 <b>Cambiar valor de la fila ${fila}</b>\n\nEscribe:\n<code>/valor ${fila} 5000</code>\n\nToca ↩️ Volver para regresar.`,
+      `💲 <b>Cambiar valor de #${id}</b>\n\nEscribe:\n<code>/valor ${id} 5000</code>\n\nToca ↩️ Volver para regresar.`,
       { reply_markup: { inline_keyboard: [[{ text: '↩️ Volver', callback_data: `volver:${fila}` }]] } }
     );
   }
@@ -1518,8 +1678,9 @@ async function handleCallback(env, cq) {
     const fila = Number(params[0]);
     const r = await leerMovimientoPorFila(env, fila);
     if (!r) return;
+    const id = String(r[0] || fila).trim();
     return editarMensaje(env, chatId, messageId,
-      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      `🕒 <b>Borrador</b> (ID ${id})\n` +
       textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], r[9]) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
@@ -1535,8 +1696,9 @@ async function handleCallback(env, cq) {
       await aprenderDeCorreccion(env, rAntes[8], nuevoRubro);
     }
     const r = await leerMovimientoPorFila(env, fila);
+    const id = String(r[0] || fila).trim();
     return editarMensaje(env, chatId, messageId,
-      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      `🕒 <b>Borrador</b> (ID ${id})\n` +
       textoBorrador(r[1], nuevoRubro, parsearValor(r[7]), r[8], r[9]) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
@@ -1548,8 +1710,9 @@ async function handleCallback(env, cq) {
     const nuevoMedio = params.slice(1).join(':');
     await actualizarMedio(env, fila, nuevoMedio);
     const r = await leerMovimientoPorFila(env, fila);
+    const id = String(r[0] || fila).trim();
     return editarMensaje(env, chatId, messageId,
-      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      `🕒 <b>Borrador</b> (ID ${id})\n` +
       textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], nuevoMedio) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
@@ -1565,7 +1728,7 @@ async function handleCallback(env, cq) {
     const fila = Number(params[0]);
     try { await borrarFila(env, fila); } catch (e) { /* noop */ }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    return enviar(env, chatId, `🗑️ Fila ${fila} eliminada`);
+    return enviar(env, chatId, `🗑️ Eliminado`);
   }
 
   if (accion === 'cancelar_borrar') {
@@ -1590,8 +1753,10 @@ async function handleCallback(env, cq) {
     });
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     await borrarMensajesDeBorradoresViejos(env, chatId);
+    const r = await leerMovimientoPorFila(env, fila);
+    const id = String(r?.[0] || fila).trim();
     const msgResp = await enviar(env, chatId,
-      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      `🕒 <b>Borrador</b> (ID ${id})\n` +
       textoBorrador(fecha, rubro, -monto, desc, 'Efectivo') +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
@@ -1619,14 +1784,42 @@ async function handleCallback(env, cq) {
   if (accion === 'correo_ver') {
     const fila = Number(params[0]);
     const r = await leerMovimientoPorFila(env, fila);
-    if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré la fila ${fila}.`);
+    if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré.`);
     const valor = parsearValor(r[7]);
+    const id = String(r[0] || fila).trim();
     return editarMensaje(env, chatId, messageId,
-      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      `🕒 <b>Borrador</b> (ID ${id})\n` +
       textoBorrador(r[1], r[6], valor, r[8], r[9]) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoCorreoIndividual(fila) }
     );
+  }
+
+  // ---------- C.5 CALLBACKS DE PRESUPUESTO ----------
+
+  if (accion === 'aplicar_presupuesto') {
+    const año = Number(params[0]);
+    const mesNum = Number(params[1]);
+    try {
+      const data = await calcularSugerenciaMensual(env);
+      let aplicados = 0;
+      for (const s of data.sugerencia) {
+        await guardarPresupuesto(env, año, mesNum, s.rubro, s.promedio);
+        aplicados++;
+      }
+      try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+      return enviar(env, chatId,
+        `✅ Apliqué ${aplicados} rubros al presupuesto de <b>${MESES[mesNum - 1]} ${año}</b>.\n\nUsa /presupuesto para verlo.`
+      );
+    } catch (e) {
+      console.log('[APLICAR_PRESUPUESTO] Error:', e.message);
+      return enviar(env, chatId, `❌ Error aplicando: ${e.message}`);
+    }
+  }
+
+  if (accion === 'ignorar_presupuesto') {
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    return enviar(env, chatId, `🚫 Sugerencia ignorada`);
   }
 }
 
@@ -1661,12 +1854,23 @@ export default {
           await enviar(env, chatId, mensajeResumen(data));
         }
       } else if (event.cron === '0 12 1 * *') {
-        console.log('Cron mensual disparado (reservado C.5):', new Date().toISOString());
+        console.log('Cron mensual disparado:', new Date().toISOString());
       } else if (event.cron === '0 23 28-31 * *') {
         const hoyCol = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
         const ultimoDia = new Date(hoyCol.getFullYear(), hoyCol.getMonth() + 1, 0).getDate();
         if (hoyCol.getDate() === ultimoDia) {
-          console.log('Último día del mes (reservado C.5):', new Date().toISOString());
+          // C.5: análisis mensual automático
+          const chatId = env.TELEGRAM_CHAT_ID;
+          try {
+            const data = await calcularSugerenciaMensual(env);
+            if (data.sugerencia.length > 0) {
+              await enviar(env, chatId, mensajeSugerencia(data), {
+                reply_markup: tecladoAplicarPresupuesto(data.añoProx, data.mesProx),
+              });
+            }
+          } catch (e) {
+            console.log('[C.5] Error análisis mensual:', e.message);
+          }
         }
       } else if (event.cron === '*/30 * * * *') {
         const resultado = await limpiarBorradoresViejos(env);
