@@ -36,7 +36,6 @@ export async function borrarMensaje(env, chatId, messageId) {
 
 // ---------- TECLADOS ----------
 
-// Teclado del borrador (creación de gasto nuevo)
 export function tecladoBorrador(fila) {
   return {
     inline_keyboard: [
@@ -51,7 +50,6 @@ export function tecladoBorrador(fila) {
   };
 }
 
-// Teclado para editar un movimiento existente
 export function tecladoBorradorEdicion(fila) {
   return {
     inline_keyboard: [
@@ -131,11 +129,14 @@ export function tecladoListado(offset, total) {
   return { inline_keyboard: filas };
 }
 
-export function tecladoConfirmarValorAlto(fila) {
-  return {
-    inline_keyboard: [[
-      { text: '✅ Sí, es correcto', callback_data: `valor_ok:${fila}` },
-      { text: '↩️ No, cancelar', callback_data: `volver:${fila}` },
-    ]],
-  };
+export function tecladoBorradores(filas) {
+  const botones = [];
+  for (const b of filas) {
+    botones.push([
+      { text: `✅ #${b.fila}`, callback_data: `ok:${b.fila}` },
+      { text: `✏️ #${b.fila}`, callback_data: `volver:${b.fila}` },
+      { text: `🗑️ #${b.fila}`, callback_data: `cancelar:${b.fila}` },
+    ]);
+  }
+  return { inline_keyboard: botones };
 }

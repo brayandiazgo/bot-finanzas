@@ -93,7 +93,6 @@ async function obtenerSiguienteFila(env) {
   return ultimaConDato + 1;
 }
 
-// Fórmulas en ESPAÑOL con punto y coma
 function formulasFila(fila) {
   const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
   const DIAS = ['lunes','martes','miércoles','jueves','viernes','sábado','domingo'];
@@ -111,22 +110,10 @@ export async function appendMovimiento(env, mov) {
   const f = formulasFila(fila);
 
   const valores = [[
-    f.A,
-    mov.fecha,
-    f.C,
-    f.D,
-    f.E,
-    f.F,
-    mov.rubro,
-    mov.valor,
-    mov.descripcion || '',
-    mov.medio || 'Efectivo',
-    mov.tipo,
-    mov.fuente || 'manual',
-    mov.estado || 'pendiente',
-    mov.id_correo || '',
-    mov.nota || '',
-    '', // P: msg_id (se llena después)
+    f.A, mov.fecha, f.C, f.D, f.E, f.F,
+    mov.rubro, mov.valor, mov.descripcion || '', mov.medio || 'Efectivo',
+    mov.tipo, mov.fuente || 'manual', mov.estado || 'pendiente',
+    mov.id_correo || '', mov.nota || '', '',
   ]];
 
   await sheetsRequest(env, `/values/MOVIMIENTOS!A${fila}:P${fila}?valueInputOption=USER_ENTERED`, {
@@ -172,7 +159,6 @@ export async function actualizarDescripcion(env, fila, desc) {
   });
 }
 
-// Guarda el message_id del borrador en la columna P
 export async function guardarMsgId(env, fila, msgId) {
   return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
@@ -181,7 +167,7 @@ export async function guardarMsgId(env, fila, msgId) {
 }
 
 export async function limpiarMsgId(env, fila) {
-  return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}`, {
+  return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
     body: JSON.stringify({ values: [['']] }),
   });
@@ -302,30 +288,65 @@ export async function listarMovimientos(env, limite, offset, incluirPendientes =
   };
 }
 
+export async function listarBorradores(env) {
+  const data = await sheetsRequest(
+    env,
+    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
+  );
+  const rows = data.values || [];
+  const resultado = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || !r[1]) continue;
+    if (r[12] !== 'pendiente') continue;
+    resultado.push({ fila: i + 1, data: r });
+  }
+  return resultado;
+}
+
+// Devuelve la lista de msg_id de todos los borradores en la hoja
+export async function obtenerMsgIdsBorradores(env) {
+  const data = await sheetsRequest(
+    env,
+    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
+  );
+  const rows = data.values || [];
+  const msgs = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r || !r[12]) continue;
+    if (r[12] !== 'pendiente') continue;
+    if (r[15]) msgs.push(Number(r[15]));
+  }
+  return msgs;
+}
+
 export async function limpiarBorradoresViejos(env) {
   const data = await sheetsRequest(
     env,
     `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
   );
   const rows = data.values || [];
-  const filasABorrar = [];
+  const aBorrar = [];
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r || !r[12]) continue;
     if (r[12] !== 'pendiente') continue;
-    filasABorrar.push(i + 1);
+    aBorrar.push({ fila: i + 1, msgId: r[15] ? Number(r[15]) : null });
   }
 
-  filasABorrar.sort((a, b) => b - a);
+  aBorrar.sort((a, b) => b.fila - a.fila);
   let borradas = 0;
-  for (const fila of filasABorrar) {
+  const msgs = [];
+  for (const { fila, msgId } of aBorrar) {
     try {
       await borrarFila(env, fila);
+      if (msgId) msgs.push(msgId);
       borradas++;
     } catch (e) {
       console.error('Error borrando fila', fila, e.message);
     }
   }
-  return borradas;
+  return { borradas, msgs };
 }

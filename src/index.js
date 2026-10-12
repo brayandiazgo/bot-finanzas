@@ -1,44 +1,27 @@
 // src/index.js
 import {
-  enviar,
-  tg,
-  editarMensaje,
-  borrarMensaje,
-  tecladoBorrador,
-  tecladoBorradorEdicion,
-  tecladoRubros,
-  tecladoMedios,
-  tecladoDuplicado,
-  tecladoBorrarConfirmar,
-  tecladoListado,
-  tecladoConfirmarEliminar,
-  tecladoConfirmarValorAlto,
+  enviar, tg, editarMensaje, borrarMensaje,
+  tecladoBorrador, tecladoBorradorEdicion,
+  tecladoRubros, tecladoMedios, tecladoDuplicado,
+  tecladoBorrarConfirmar, tecladoListado,
+  tecladoConfirmarEliminar, tecladoBorradores,
 } from './telegram.js';
 import {
-  appendMovimiento,
-  leerMovimientos,
-  leerMovimientoPorFila,
-  actualizarRubro,
-  actualizarMedio,
-  actualizarEstado,
-  actualizarValor,
-  actualizarDescripcion,
-  guardarMsgId,
-  limpiarMsgId,
-  borrarFila,
-  leerPresupuestoMes,
-  parsearValor,
-  normalizarFecha,
-  limpiarBorradoresViejos,
-  listarMovimientos,
+  appendMovimiento, leerMovimientos, leerMovimientoPorFila,
+  actualizarRubro, actualizarMedio, actualizarEstado,
+  actualizarValor, actualizarDescripcion,
+  guardarMsgId, limpiarMsgId, borrarFila,
+  leerPresupuestoMes, parsearValor, normalizarFecha,
+  limpiarBorradoresViejos, listarMovimientos, listarBorradores,
+  obtenerMsgIdsBorradores,
 } from './sheets.js';
 
-const TOPE_VALOR = 1000000;       // Tope duro
-const UMBRAL_CONFIRMAR = 500000;  // Pide confirmación si supera esto
+const TOPE_VALOR = 1000000;
+const MAX_BORRADORES = 5;
 
 const RUBROS_KEYWORDS = {
   'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada'],
-  'Alimentación': ['almuerzo', 'desayuno', 'comida', 'rappi', 'domicilio', 'restaurante', 'cafe', 'pan', 'arepa', 'tostado', 'hamburguesa', 'pizza', 'oblea', 'mecato', 'helado', 'fresas', 'empanada', 'sandwich', 'leche', 'queso', 'tinto'],
+  'Alimentación': ['almuerzo', 'desayuno', 'comida', 'rappi', 'domicilio', 'restaurante', 'cafe', 'pan', 'arepa', 'tostado', 'hamburguesa', 'pizza', 'oblea', 'mecato', 'helado', 'fresas', 'empanada', 'sandwich', 'leche', 'queso', 'tinto', 'caldo', 'cena'],
   'Recibos': ['luz', 'agua', 'gas natural', 'internet', 'celular', 'tigo', 'icloud', 'energia', 'energía', 'aseo', 'papel higienico', 'recibo', 'plan de datos'],
   'Transporte': ['uber', 'didi', 'taxi', 'bus', 'transmilenio', 'sitp', 'parqueadero', 'pasaje'],
   'Cuidado personal': ['corte de cabello', 'corte cabello', 'uña', 'espi', 'medicamento', 'zapatos', 'peluqueria'],
@@ -101,17 +84,13 @@ function parsearGasto(texto) {
   const numeros = [...limpio.matchAll(/\$?\s*([\d][\d.,]*)/g)]
     .map(m => ({ raw: m[0], num: Number(m[1].replace(/[.,]/g, '')), index: m.index }))
     .filter(x => x.num >= 100);
-
   if (numeros.length === 0) return null;
-
   const monto = numeros[0].num;
   const rawMonto = numeros[0].raw;
-
   let desc = limpio.replace(rawMonto, '').trim();
   desc = desc.replace(/^(en|de|por|para|el|la|los|las|un|una)\s+/i, '').trim();
   desc = desc.replace(/^(gaste|gasté|compré|compre|pague|pagué|pagar)\s+/i, '').trim();
   desc = desc.replace(/\s+en\s+/i, ' ').trim();
-
   if (!desc) return null;
   return { monto, desc };
 }
@@ -158,9 +137,7 @@ async function buscarDuplicado(env, descripcion, monto) {
   const hace1h = new Date(Date.now() - 60 * 60 * 1000);
   const hace1hCol = new Date(hace1h.toLocaleString('en-US', { timeZone: 'America/Bogota' }));
   const desde = hace1hCol.toISOString().slice(0, 10);
-
   const rows = await leerMovimientos(env, desde, hoy, false);
-
   for (let i = rows.length - 1; i >= 0; i--) {
     const r = rows[i].data;
     const rMonto = Math.abs(parsearValor(r[7]));
@@ -182,6 +159,18 @@ function textoBorrador(fecha, rubro, valor, desc, medio) {
   );
 }
 
+// Borra del chat todos los mensajes de borradores en `pendiente` excepto el que estamos creando
+async function borrarMensajesDeBorradoresViejos(env, chatId, exceptoFila) {
+  try {
+    const msgIds = await obtenerMsgIdsBorradores(env);
+    for (const msgId of msgIds) {
+      try { await borrarMensaje(env, chatId, msgId); } catch (e) { /* noop */ }
+    }
+  } catch (e) {
+    console.error('Error borrando mensajes viejos:', e.message);
+  }
+}
+
 // ---------- HANDLERS ----------
 
 async function handleStart(env, chatId) {
@@ -197,7 +186,8 @@ async function handleStart(env, chatId) {
     `/hoy — movimientos de hoy\n` +
     `/semana — últimos 7 días\n` +
     `/presupuesto — ver presupuesto del mes\n` +
-    `/listar — últimos 10 movimientos\n\n` +
+    `/listar — últimos 10 movimientos\n` +
+    `/borradores — borradores pendientes\n\n` +
     `<b>Editar:</b>\n` +
     `/editar N — modificar el movimiento N\n` +
     `/borrar N — eliminar el movimiento N\n` +
@@ -229,16 +219,13 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     );
   }
 
+  // Primero: borra los mensajes de borradores viejos del chat (pero NO las filas)
+  await borrarMensajesDeBorradoresViejos(env, chatId);
+
   const medioFinal = medio || 'Efectivo';
   const fila = await appendMovimiento(env, {
-    fecha,
-    rubro,
-    valor: -monto,
-    descripcion: desc,
-    medio: medioFinal,
-    tipo: 'Gasto',
-    fuente: 'manual',
-    estado: 'pendiente',
+    fecha, rubro, valor: -monto, descripcion: desc, medio: medioFinal,
+    tipo: 'Gasto', fuente: 'manual', estado: 'pendiente',
   });
 
   const msgResp = await enviar(env, chatId,
@@ -248,10 +235,18 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     { reply_markup: tecladoBorrador(fila) }
   );
 
-  // Guardamos el message_id del borrador en la columna P
   if (msgResp && msgResp.ok && msgResp.result) {
     try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
   }
+
+  try {
+    const borradores = await listarBorradores(env);
+    if (borradores.length > MAX_BORRADORES) {
+      await enviar(env, chatId,
+        `💡 Tienes ${borradores.length} borradores abiertos. Usa /borradores para gestionarlos.`
+      );
+    }
+  } catch (e) { /* noop */ }
 
   return msgResp;
 }
@@ -290,18 +285,13 @@ async function handleSaldo(env, chatId) {
   if (totalPresupuesto > 0) {
     const pct = ((Math.abs(gastos) / totalPresupuesto) * 100).toFixed(1);
     const disponible = totalPresupuesto - Math.abs(gastos);
-    msg +=
-      `🎯 Presupuesto: $${fmt(totalPresupuesto)}\n` +
-      `📈 Usado: ${pct}%\n` +
-      `💰 Disponible: $${fmt(disponible)}\n\n`;
+    msg += `🎯 Presupuesto: $${fmt(totalPresupuesto)}\n📈 Usado: ${pct}%\n💰 Disponible: $${fmt(disponible)}\n\n`;
   }
 
   const top = Object.entries(porRubro).sort((a, b) => b[1] - a[1]).slice(0, 3);
   if (top.length > 0) {
     msg += `<b>Top rubros:</b>\n`;
-    for (const [rubro, monto] of top) {
-      msg += `• ${rubro}: $${fmt(monto)}\n`;
-    }
+    for (const [rubro, monto] of top) msg += `• ${rubro}: $${fmt(monto)}\n`;
   }
 
   return enviar(env, chatId, msg);
@@ -383,9 +373,7 @@ async function handleSemana(env, chatId) {
   }
 
   let msg = `📅 <b>Últimos 7 días</b>\n\n`;
-  msg += `Ingresos: $${fmt(ingresos)}\n`;
-  msg += `Gastos: $${fmt(Math.abs(gastos))}\n`;
-  msg += `Balance: $${fmt(ingresos + gastos)}\n\n`;
+  msg += `Ingresos: $${fmt(ingresos)}\nGastos: $${fmt(Math.abs(gastos))}\nBalance: $${fmt(ingresos + gastos)}\n\n`;
   msg += `<b>Por rubro:</b>\n`;
   for (const [rubro, monto] of Object.entries(porRubro).sort((a, b) => b[1] - a[1])) {
     msg += `• ${rubro}: $${fmt(monto)}\n`;
@@ -398,9 +386,7 @@ async function handlePresupuesto(env, chatId) {
   const año = Number(hoy.slice(0, 4));
   const mesNum = Number(hoy.slice(5, 7));
   const presupuesto = await leerPresupuestoMes(env, año, mesNum);
-  if (presupuesto.length === 0) {
-    return enviar(env, chatId, '📭 No hay presupuesto cargado para este mes.');
-  }
+  if (presupuesto.length === 0) return enviar(env, chatId, '📭 No hay presupuesto cargado para este mes.');
   let msg = `🎯 <b>Presupuesto del mes</b>\n\n`;
   let total = 0;
   for (const p of presupuesto) {
@@ -416,7 +402,6 @@ async function handlePresupuesto(env, chatId) {
 async function handleListar(env, chatId, offset = 0) {
   const { total, items } = await listarMovimientos(env, 10, offset, false);
   if (total === 0) return enviar(env, chatId, '📭 No hay movimientos confirmados.');
-
   let msg = `📋 <b>Movimientos recientes</b> (${offset + 1}-${Math.min(offset + 10, total)} de ${total})\n\n`;
   for (const { fila, data: r } of items) {
     const valor = parsearValor(r[7]);
@@ -426,10 +411,22 @@ async function handleListar(env, chatId, offset = 0) {
     msg += `<b>#${fila}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
   }
   msg += `\nUsa /editar N o /borrar N para modificar un movimiento.`;
+  return enviar(env, chatId, msg, { reply_markup: tecladoListado(offset, total) });
+}
 
-  return enviar(env, chatId, msg, {
-    reply_markup: tecladoListado(offset, total),
-  });
+async function handleBorradores(env, chatId) {
+  const borradores = await listarBorradores(env);
+  if (borradores.length === 0) return enviar(env, chatId, '📭 No hay borradores pendientes.');
+
+  let msg = `📝 <b>Borradores pendientes</b> (${borradores.length})\n\n`;
+  for (const { fila, data: r } of borradores) {
+    const valor = parsearValor(r[7]);
+    const fecha = normalizarFecha(r[1]);
+    msg += `<b>#${fila}</b> ${fecha} ➖ $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'})</i>\n`;
+  }
+  msg += `\n✅ Guardar · ✏️ Editar · 🗑️ Descartar`;
+
+  return enviar(env, chatId, msg, { reply_markup: tecladoBorradores(borradores) });
 }
 
 async function handleEditar(env, chatId, fila) {
@@ -438,6 +435,9 @@ async function handleEditar(env, chatId, fila) {
   if (r[10] !== 'Gasto') return enviar(env, chatId, `❌ Solo puedo editar gastos. Esta fila es un ${r[10]}.`);
 
   await actualizarEstado(env, fila, 'pendiente');
+
+  // Borra los mensajes de borradores viejos, así solo queda el nuevo abajo
+  await borrarMensajesDeBorradoresViejos(env, chatId);
 
   const msgResp = await enviar(env, chatId,
     `✏️ <b>Editando fila ${fila}</b>\n\n` +
@@ -448,23 +448,17 @@ async function handleEditar(env, chatId, fila) {
   if (msgResp && msgResp.ok && msgResp.result) {
     try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
   }
-
   return msgResp;
 }
 
 async function handleBorrar(env, chatId, fila) {
   const r = await leerMovimientoPorFila(env, fila);
   if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
-
   const valor = parsearValor(r[7]);
   const fecha = normalizarFecha(r[1]);
-
   return enviar(env, chatId,
     `⚠️ ¿Borrar este movimiento?\n\n` +
-    `<b>#${fila}</b> ${fecha}\n` +
-    `$${fmt(Math.abs(valor))} — ${r[8] || ''}\n` +
-    `Rubro: <i>${r[6]}</i>\n` +
-    `Medio: <i>${r[9]}</i>`,
+    `<b>#${fila}</b> ${fecha}\n$${fmt(Math.abs(valor))} — ${r[8] || ''}\nRubro: <i>${r[6]}</i>\nMedio: <i>${r[9]}</i>`,
     { reply_markup: tecladoBorrarConfirmar(fila) }
   );
 }
@@ -473,75 +467,47 @@ async function handleValor(env, chatId, texto) {
   const m = texto.match(/^(\d+)\s+([\d.,]+)$/);
   if (!m) {
     return enviar(env, chatId,
-      `❌ Formato incorrecto.\n\n` +
-      `Uso: <code>/valor N MONTO</code>\n` +
-      `Ejemplo: <code>/valor 574 5000</code>\n\n` +
-      `El monto solo puede tener números.`
+      `❌ Formato incorrecto.\n\nUso: <code>/valor N MONTO</code>\nEjemplo: <code>/valor 574 5000</code>\n\nEl monto solo puede tener números.`
     );
   }
   const fila = Number(m[1]);
   const nuevoValor = Number(m[2].replace(/[.,]/g, ''));
 
-  if (nuevoValor <= 0) {
-    return enviar(env, chatId, '❌ El monto debe ser mayor a 0.');
-  }
+  if (nuevoValor <= 0) return enviar(env, chatId, '❌ El monto debe ser mayor a 0.');
   if (nuevoValor > TOPE_VALOR) {
     return enviar(env, chatId,
-      `❌ El monto supera el tope de <b>$${fmt(TOPE_VALOR)}</b>.\n` +
-      `Si de verdad es tan alto, edítalo a mano en la hoja.`
+      `❌ El monto supera el tope de <b>$${fmt(TOPE_VALOR)}</b>.\nSi de verdad es tan alto, edítalo a mano en la hoja.`
     );
   }
 
   const r = await leerMovimientoPorFila(env, fila);
   if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
 
-  if (nuevoValor > UMBRAL_CONFIRMAR) {
-    // Pide confirmación
-    return enviar(env, chatId,
-      `⚠️ El nuevo valor es <b>$${fmt(nuevoValor)}</b>, mayor a $${fmt(UMBRAL_CONFIRMAR)}.\n` +
-      `¿Estás seguro?`,
-      { reply_markup: tecladoConfirmarValorAlto(fila) }
-    );
-  }
-
   const signo = r[10] === 'Gasto' ? -1 : 1;
   await actualizarValor(env, fila, signo * nuevoValor);
 
-  // Refresca el mensaje del borrador si existe
-  await refrescarBorrador(env, chatId, fila, r);
+  if (r[15]) {
+    try {
+      const rNuevo = await leerMovimientoPorFila(env, fila);
+      if (rNuevo && rNuevo[12] === 'pendiente') {
+        await editarMensaje(env, chatId, Number(r[15]),
+          `🕒 <b>Borrador</b> (fila ${fila})\n` +
+          textoBorrador(rNuevo[1], rNuevo[6], parsearValor(rNuevo[7]), rNuevo[8], rNuevo[9]) +
+          `\n\nPresiona ✅ para guardar:`,
+          { reply_markup: tecladoBorrador(fila) }
+        );
+      }
+    } catch (e) { console.error('No pude refrescar:', e.message); }
+  }
 
   return enviar(env, chatId, `✅ Fila ${fila} → valor <b>$${fmt(nuevoValor)}</b>`);
-}
-
-// Refresca el mensaje del borrador (si tiene msg_id guardado)
-async function refrescarBorrador(env, chatId, fila, rOriginal) {
-  const msgId = rOriginal?.[15];
-  if (!msgId) return;
-  try {
-    const rNuevo = await leerMovimientoPorFila(env, fila);
-    if (!rNuevo) return;
-    if (rNuevo[12] !== 'pendiente') return;
-    const teclado = rNuevo[10] === 'Gasto' && rNuevo[12] === 'pendiente'
-      ? tecladoBorrador(fila)
-      : tecladoBorrador(fila);
-    await editarMensaje(env, chatId, Number(msgId),
-      `🕒 <b>Borrador</b> (fila ${fila})\n` +
-      textoBorrador(rNuevo[1], rNuevo[6], parsearValor(rNuevo[7]), rNuevo[8], rNuevo[9]) +
-      `\n\nPresiona ✅ para guardar:`,
-      { reply_markup: teclado }
-    );
-  } catch (e) {
-    console.error('No pude refrescar borrador:', e.message);
-  }
 }
 
 async function handleDesc(env, chatId, texto) {
   const m = texto.match(/^(\d+)\s+(.+)$/);
   if (!m) {
     return enviar(env, chatId,
-      `❌ Formato incorrecto.\n\n` +
-      `Uso: <code>/desc N TEXTO</code>\n` +
-      `Ejemplo: <code>/desc 574 almuerzo con Juan</code>`
+      `❌ Formato incorrecto.\n\nUso: <code>/desc N TEXTO</code>\nEjemplo: <code>/desc 574 almuerzo con Juan</code>`
     );
   }
   const fila = Number(m[1]);
@@ -549,7 +515,21 @@ async function handleDesc(env, chatId, texto) {
   const r = await leerMovimientoPorFila(env, fila);
   if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
   await actualizarDescripcion(env, fila, nuevaDesc);
-  await refrescarBorrador(env, chatId, fila, r);
+
+  if (r[15]) {
+    try {
+      const rNuevo = await leerMovimientoPorFila(env, fila);
+      if (rNuevo && rNuevo[12] === 'pendiente') {
+        await editarMensaje(env, chatId, Number(r[15]),
+          `🕒 <b>Borrador</b> (fila ${fila})\n` +
+          textoBorrador(rNuevo[1], rNuevo[6], parsearValor(rNuevo[7]), rNuevo[8], rNuevo[9]) +
+          `\n\nPresiona ✅ para guardar:`,
+          { reply_markup: tecladoBorrador(fila) }
+        );
+      }
+    } catch (e) { console.error('No pude refrescar:', e.message); }
+  }
+
   return enviar(env, chatId, `✅ Fila ${fila} → "${nuevaDesc}"`);
 }
 
@@ -568,30 +548,21 @@ async function handleMensaje(env, msg) {
   if (texto.startsWith('/semana')) return handleSemana(env, chatId);
   if (texto.startsWith('/presupuesto')) return handlePresupuesto(env, chatId);
   if (texto.startsWith('/listar')) return handleListar(env, chatId, 0);
+  if (texto.startsWith('/borradores')) return handleBorradores(env, chatId);
 
   if (texto.startsWith('/editar')) {
     const m = texto.match(/^\/editar\s+(\d+)/);
-    if (!m) {
-      return enviar(env, chatId,
-        `❌ Falta el número de fila.\n\n` +
-        `Uso: <code>/editar N</code>\n` +
-        `Ejemplo: <code>/editar 574</code>\n\n` +
-        `Usa /listar para ver los números de fila.`
-      );
-    }
+    if (!m) return enviar(env, chatId,
+      `❌ Falta el número de fila.\n\nUso: <code>/editar N</code>\nEjemplo: <code>/editar 574</code>\n\nUsa /listar para ver los números de fila.`
+    );
     return handleEditar(env, chatId, Number(m[1]));
   }
 
   if (texto.startsWith('/borrar')) {
     const m = texto.match(/^\/borrar\s+(\d+)/);
-    if (!m) {
-      return enviar(env, chatId,
-        `❌ Falta el número de fila.\n\n` +
-        `Uso: <code>/borrar N</code>\n` +
-        `Ejemplo: <code>/borrar 574</code>\n\n` +
-        `Usa /listar para ver los números de fila.`
-      );
-    }
+    if (!m) return enviar(env, chatId,
+      `❌ Falta el número de fila.\n\nUso: <code>/borrar N</code>\nEjemplo: <code>/borrar 574</code>\n\nUsa /listar para ver los números de fila.`
+    );
     return handleBorrar(env, chatId, Number(m[1]));
   }
 
@@ -628,67 +599,56 @@ async function handleCallback(env, cq) {
   const chatId = cq.message.chat.id;
   const messageId = cq.message.message_id;
   const data = cq.data || '';
-
   const [accion, ...params] = data.split(':');
 
-  // --- GUARDAR ---
   if (accion === 'ok') {
     const fila = Number(params[0]);
     await actualizarEstado(env, fila, 'confirmado');
-    await limpiarMsgId(env, fila);
+    try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
     const r = await leerMovimientoPorFila(env, fila);
     const valor = parsearValor(r?.[7]);
     const desc = r?.[8] || '';
     const rubro = r?.[6] || '';
     const medio = r?.[9] || '';
-
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
-
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId,
       `✅ <b>Guardado</b> (fila ${fila})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
     );
   }
 
-  // --- CANCELAR (borra fila + mensaje) ---
   if (accion === 'cancelar') {
     const fila = Number(params[0]);
-    await borrarFila(env, fila);
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    try { await borrarFila(env, fila); } catch (e) { /* noop */ }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Cancelado (fila ${fila} eliminada)`);
   }
 
-  // --- ELIMINAR (desde confirmación) ---
   if (accion === 'eliminar') {
     const fila = Number(params[0]);
-    await borrarFila(env, fila);
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    try { await borrarFila(env, fila); } catch (e) { /* noop */ }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Fila ${fila} eliminada`);
   }
 
-  // --- CONFIRMAR ELIMINAR (pide confirmación) ---
   if (accion === 'confirmar_eliminar') {
     const fila = Number(params[0]);
     const r = await leerMovimientoPorFila(env, fila);
     if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré la fila ${fila}.`);
     return editarMensaje(env, chatId, messageId,
       `⚠️ <b>¿Seguro que quieres eliminar la fila ${fila}?</b>\n\n` +
-      `<b>$${fmt(Math.abs(parsearValor(r[7])))}</b> — ${r[8] || ''}\n` +
-      `Rubro: <i>${r[6]}</i>\n\n` +
-      `Esto no se puede deshacer.`,
+      `<b>$${fmt(Math.abs(parsearValor(r[7])))}</b> — ${r[8] || ''}\nRubro: <i>${r[6]}</i>\n\nEsto no se puede deshacer.`,
       { reply_markup: tecladoConfirmarEliminar(fila) }
     );
   }
 
-  // --- VOLVER SIN CAMBIOS (edición) ---
   if (accion === 'volver_edicion') {
     const fila = Number(params[0]);
     await actualizarEstado(env, fila, 'confirmado');
-    await limpiarMsgId(env, fila);
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `↩️ Fila ${fila} sin cambios`);
   }
 
-  // --- VER MENÚ DE RUBROS ---
   if (accion === 'rubro') {
     const fila = Number(params[0]);
     return editarMensaje(env, chatId, messageId, `Elige el rubro:`, {
@@ -696,7 +656,6 @@ async function handleCallback(env, cq) {
     });
   }
 
-  // --- VER MENÚ DE MEDIOS ---
   if (accion === 'medio') {
     const fila = Number(params[0]);
     return editarMensaje(env, chatId, messageId, `¿Cómo pagaste?`, {
@@ -704,19 +663,14 @@ async function handleCallback(env, cq) {
     });
   }
 
-  // --- BOTÓN VALOR (solo guía) ---
   if (accion === 'valor') {
     const fila = Number(params[0]);
     return editarMensaje(env, chatId, messageId,
-      `💲 <b>Cambiar valor de la fila ${fila}</b>\n\n` +
-      `Escribe el comando así:\n` +
-      `<code>/valor ${fila} 5000</code>\n\n` +
-      `Toca ↩️ Volver para regresar al borrador.`,
+      `💲 <b>Cambiar valor de la fila ${fila}</b>\n\nEscribe:\n<code>/valor ${fila} 5000</code>\n\nToca ↩️ Volver para regresar.`,
       { reply_markup: { inline_keyboard: [[{ text: '↩️ Volver', callback_data: `volver:${fila}` }]] } }
     );
   }
 
-  // --- VOLVER AL BORRADOR ---
   if (accion === 'volver') {
     const fila = Number(params[0]);
     const r = await leerMovimientoPorFila(env, fila);
@@ -729,7 +683,6 @@ async function handleCallback(env, cq) {
     );
   }
 
-  // --- SET RUBRO ---
   if (accion === 'setrubro') {
     const fila = Number(params[0]);
     const nuevoRubro = params.slice(1).join(':');
@@ -743,7 +696,6 @@ async function handleCallback(env, cq) {
     );
   }
 
-  // --- SET MEDIO ---
   if (accion === 'setmedio') {
     const fila = Number(params[0]);
     const nuevoMedio = params.slice(1).join(':');
@@ -757,40 +709,25 @@ async function handleCallback(env, cq) {
     );
   }
 
-  // --- CONFIRMAR VALOR ALTO ---
-  if (accion === 'valor_ok') {
-    const fila = Number(params[0]);
-    const r = await leerMovimientoPorFila(env, fila);
-    if (!r) return;
-    const valor = parsearValor(r[7]);
-    const signo = r[10] === 'Gasto' ? -1 : 1;
-    await actualizarValor(env, fila, signo * Math.abs(valor));
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
-    return enviar(env, chatId, `✅ Fila ${fila} → valor <b>$${fmt(Math.abs(valor))}</b>`);
-  }
-
-  // --- LISTAR PAGINACIÓN ---
   if (accion === 'listar') {
     const offset = Number(params[0]) || 0;
     return handleListar(env, chatId, offset);
   }
 
-  // --- CONFIRMAR BORRAR (desde /borrar) ---
   if (accion === 'confirmar_borrar') {
     const fila = Number(params[0]);
-    await borrarFila(env, fila);
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    try { await borrarFila(env, fila); } catch (e) { /* noop */ }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Fila ${fila} eliminada`);
   }
 
   if (accion === 'cancelar_borrar') {
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `↩️ Borrado cancelado`);
   }
 
-  // --- DUPLICADOS ---
   if (accion === 'dup_ignorar') {
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🚫 Ignorado (era duplicado)`);
   }
 
@@ -801,23 +738,19 @@ async function handleCallback(env, cq) {
     const rubro = categorizar(desc);
     const fecha = hoyColombia();
     const fila = await appendMovimiento(env, {
-      fecha,
-      rubro,
-      valor: -monto,
-      descripcion: desc,
-      medio: 'Efectivo',
-      tipo: 'Gasto',
-      fuente: 'manual',
-      estado: 'pendiente',
+      fecha, rubro, valor: -monto, descripcion: desc, medio: 'Efectivo',
+      tipo: 'Gasto', fuente: 'manual', estado: 'pendiente',
     });
-    const msgResp = await editarMensaje(env, chatId, messageId,
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    await borrarMensajesDeBorradoresViejos(env, chatId);
+    const msgResp = await enviar(env, chatId,
       `🕒 <b>Borrador</b> (fila ${fila})\n` +
       textoBorrador(fecha, rubro, -monto, desc, 'Efectivo') +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
     );
-    if (msgResp && msgResp.ok) {
-      try { await guardarMsgId(env, fila, messageId); } catch (e) { /* noop */ }
+    if (msgResp && msgResp.ok && msgResp.result) {
+      try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
     }
     return msgResp;
   }
@@ -826,7 +759,6 @@ async function handleCallback(env, cq) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
     if (request.method === 'POST' && url.pathname === '/webhook') {
       const update = await request.json();
       ctx.waitUntil((async () => {
@@ -842,11 +774,7 @@ export default {
       })());
       return new Response('ok');
     }
-
-    if (url.pathname === '/') {
-      return new Response('Bot finanzas activo');
-    }
-
+    if (url.pathname === '/') return new Response('Bot finanzas activo');
     return new Response('Not found', { status: 404 });
   },
 
@@ -855,8 +783,12 @@ export default {
       if (event.cron === '0 12 1 * *') {
         console.log('Cron mensual disparado:', new Date().toISOString());
       } else if (event.cron === '*/30 * * * *') {
-        const borradas = await limpiarBorradoresViejos(env);
-        console.log(`Limpieza de borradores: ${borradas} filas borradas`);
+        const resultado = await limpiarBorradoresViejos(env);
+        console.log(`Limpieza de borradores: ${resultado.borradas} filas borradas`);
+        const chatId = env.TELEGRAM_CHAT_ID;
+        for (const msgId of resultado.msgs) {
+          try { await borrarMensaje(env, chatId, msgId); } catch (e) { /* noop */ }
+        }
       }
     } catch (e) {
       console.error('Error en cron:', e.message, e.stack);
