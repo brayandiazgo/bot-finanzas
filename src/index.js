@@ -42,6 +42,14 @@ const RUBROS_KEYWORDS = {
   'Ingreso extra': ['venta', 'iphone', 'impresion', 'copias', 'cuota computador'],
 };
 
+// Lista de rubros según tu CONFIG (ya sin "Vida social / Pareja")
+const RUBROS_MENU = [
+  'Diezmo', 'Ofrenda', 'Votos', 'Primicia', 'Casa', 'Prestamo', 'Recibos',
+  'Alimentación', 'Gasolina', 'Pareja', 'Vida social', 'Regalo',
+  'Entretenimiento', 'Cuidado personal', 'Transporte', 'Trading',
+  'Donacion', 'Mantenimiento vehicular', 'Otro',
+];
+
 function categorizarBasico(texto) {
   const t = texto.toLowerCase();
   const matches = [];
@@ -121,12 +129,7 @@ function fmt(n) {
   return (negativo ? '-' : '') + out;
 }
 
-const RUBROS_MENU = [
-  'Diezmo', 'Ofrenda', 'Votos', 'Primicia', 'Casa', 'Prestamo', 'Recibos',
-  'Alimentación', 'Gasolina', 'Pareja', 'Vida social', 'Regalo',
-  'Entretenimiento', 'Cuidado personal', 'Transporte', 'Trading',
-  'Donacion', 'Mantenimiento vehicular', 'Otro',
-];
+const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
 
 function parsearGasto(texto) {
   const limpio = texto.trim();
@@ -282,7 +285,6 @@ function saludoSegunHora() {
 }
 
 function mensajeResumen(data) {
-  const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
   const mesNombre = MESES[data.mesNum - 1];
 
   let msg = `${saludoSegunHora()} <b>Brayan</b>\n\n`;
@@ -326,6 +328,9 @@ async function handleStart(env, chatId) {
     `/saldo — balance y presupuesto del mes\n` +
     `/resumen — el mismo resumen que llega en la mañana\n` +
     `/mes — resumen por rubro\n` +
+    `/rubro X — detalle de un rubro\n` +
+    `/metodos — desglose por medio de pago\n` +
+    `/tendencia — últimos 4 meses\n` +
     `/hoy — movimientos de hoy\n` +
     `/semana — últimos 7 días\n` +
     `/presupuesto — ver presupuesto del mes\n` +
@@ -495,6 +500,210 @@ async function handleMes(env, chatId) {
       } else {
         msg += `⚪ <b>${rubro}</b>: $${fmt(monto)}\n`;
       }
+    }
+  }
+
+  return enviar(env, chatId, msg);
+}
+
+async function handleRubro(env, chatId, busqueda) {
+  if (!busqueda) {
+    return enviar(env, chatId,
+      `❌ Falta el nombre del rubro.\n\nUso: <code>/rubro Gasolina</code>\n\n` +
+      `Rubros disponibles:\n${RUBROS_MENU.join(', ')}`
+    );
+  }
+
+  // Buscar rubro por nombre parcial (case insensitive, sin acentos)
+  const busqNorm = normalizar(busqueda);
+  const rubrosNorm = RUBROS_MENU.map(r => ({ original: r, norm: normalizar(r) }));
+
+  // Primero: match exacto
+  let rubroEncontrado = rubrosNorm.find(r => r.norm === busqNorm);
+
+  // Segundo: match parcial (empieza con)
+  if (!rubroEncontrado) {
+    rubroEncontrado = rubrosNorm.find(r => r.norm.startsWith(busqNorm));
+  }
+
+  // Tercero: contiene
+  if (!rubroEncontrado) {
+    rubroEncontrado = rubrosNorm.find(r => r.norm.includes(busqNorm));
+  }
+
+  if (!rubroEncontrado) {
+    return enviar(env, chatId,
+      `❌ No encontré un rubro que coincida con "${busqueda}".\n\n` +
+      `Rubros disponibles:\n${RUBROS_MENU.join(', ')}`
+    );
+  }
+
+  const rubro = rubroEncontrado.original;
+
+  const hoy = hoyColombia();
+  const año = Number(hoy.slice(0, 4));
+  const mesNum = Number(hoy.slice(5, 7));
+  const mesIni = hoy.slice(0, 7) + '-01';
+
+  const rows = await leerMovimientos(env, mesIni, hoy, true);
+
+  let gastado = 0;
+  const movs = [];
+  for (const { fila, data: r } of rows) {
+    if (r[10] !== 'Gasto') continue;
+    if (r[6] !== rubro) continue;
+    const valor = Math.abs(parsearValor(r[7]));
+    gastado += valor;
+    movs.push({ fila, fecha: normalizarFecha(r[1]), valor, desc: r[8] || '', medio: r[9] || 'Efectivo' });
+  }
+
+  const presupuesto = await leerPresupuestoMes(env, año, mesNum);
+  const presRubro = presupuesto.find(p => p.rubro === rubro);
+  const presMonto = presRubro ? presRubro.monto : 0;
+
+  let msg = `📌 <b>${rubro}</b>\n\n`;
+  msg += `📅 ${MESES[mesNum - 1].charAt(0).toUpperCase() + MESES[mesNum - 1].slice(1)} ${año}\n\n`;
+
+  if (presMonto > 0) {
+    const pct = ((gastado / presMonto) * 100).toFixed(0);
+    const disponible = presMonto - gastado;
+    const icono = pct > 100 ? '🔴' : pct >= 80 ? '🟡' : '🟢';
+    msg += `${icono} 🎯 Presupuesto: $${fmt(presMonto)}\n`;
+    msg += `💸 Gastado: $${fmt(gastado)} (${pct}%)\n`;
+    if (disponible < 0) {
+      msg += `⚠️ Excedido en $${fmt(Math.abs(disponible))}\n`;
+    } else {
+      msg += `💰 Disponible: $${fmt(disponible)}\n`;
+    }
+  } else {
+    msg += `💸 Gastado: $${fmt(gastado)}\n`;
+    msg += `<i>(sin presupuesto asignado)</i>\n`;
+  }
+
+  if (movs.length > 0) {
+    msg += `\n<b>Movimientos (${movs.length}):</b>\n`;
+    // Mostramos los últimos 10
+    const ultimos = movs.slice(-10).reverse();
+    for (const m of ultimos) {
+      msg += `#${m.fila} ${m.fecha} — $${fmt(m.valor)} ${m.desc} <i>(${m.medio})</i>\n`;
+    }
+    if (movs.length > 10) {
+      msg += `\n<i>... y ${movs.length - 10} más</i>`;
+    }
+  } else {
+    msg += `\nSin movimientos este mes.`;
+  }
+
+  return enviar(env, chatId, msg);
+}
+
+async function handleMetodos(env, chatId) {
+  const hoy = hoyColombia();
+  const mesNum = Number(hoy.slice(5, 7));
+  const mesIni = hoy.slice(0, 7) + '-01';
+
+  const rows = await leerMovimientos(env, mesIni, hoy, true);
+
+  const porMetodo = {};
+  let total = 0;
+  for (const { data: r } of rows) {
+    if (r[10] !== 'Gasto') continue;
+    const medio = r[9] || 'Efectivo';
+    const valor = Math.abs(parsearValor(r[7]));
+    if (!porMetodo[medio]) porMetodo[medio] = { monto: 0, cant: 0 };
+    porMetodo[medio].monto += valor;
+    porMetodo[medio].cant += 1;
+    total += valor;
+  }
+
+  if (total === 0) {
+    return enviar(env, chatId, `📭 Sin gastos este mes.`);
+  }
+
+  const ordenados = Object.entries(porMetodo).sort((a, b) => b[1].monto - a[1].monto);
+
+  let msg = `💳 <b>Métodos de pago</b>\n`;
+  msg += `📅 ${MESES[mesNum - 1].charAt(0).toUpperCase() + MESES[mesNum - 1].slice(1)}\n\n`;
+
+  for (const [medio, data] of ordenados) {
+    const pct = ((data.monto / total) * 100).toFixed(0);
+    msg += `<b>${medio}:</b> $${fmt(data.monto)} (${pct}%)\n`;
+    msg += `   • ${data.cant} ${data.cant === 1 ? 'movimiento' : 'movimientos'}\n`;
+  }
+
+  msg += `\n<b>Total: $${fmt(total)}</b>`;
+
+  return enviar(env, chatId, msg);
+}
+
+async function handleTendencia(env, chatId) {
+  const hoy = hoyColombia();
+  const añoHoy = Number(hoy.slice(0, 4));
+  const mesHoy = Number(hoy.slice(5, 7));
+
+  // Últimos 4 meses (incluyendo el actual)
+  const meses = [];
+  for (let i = 3; i >= 0; i--) {
+    let m = mesHoy - i;
+    let y = añoHoy;
+    while (m <= 0) { m += 12; y -= 1; }
+    meses.push({ año: y, mes: m });
+  }
+
+  const resultados = [];
+  for (const { año, mes } of meses) {
+    const mesIni = `${año}-${String(mes).padStart(2, '0')}-01`;
+    // Último día del mes
+    const ultimoDia = new Date(año, mes, 0).getDate();
+    const mesFin = `${año}-${String(mes).padStart(2, '0')}-${String(ultimoDia).padStart(2, '0')}`;
+    const finEfectivo = mesFin > hoy ? hoy : mesFin;
+
+    const rows = await leerMovimientos(env, mesIni, finEfectivo, true);
+    let gastos = 0;
+    for (const { data: r } of rows) {
+      if (r[10] !== 'Gasto') continue;
+      gastos += Math.abs(parsearValor(r[7]));
+    }
+
+    resultados.push({
+      año, mes,
+      nombreMes: `${MESES[mes - 1].charAt(0).toUpperCase() + MESES[mes - 1].slice(1)} ${año}`,
+      gastos,
+      esActual: (año === añoHoy && mes === mesHoy),
+    });
+  }
+
+  let msg = `📈 <b>Tendencia de gastos</b>\n\n`;
+
+  // Mostrar cada mes con % vs anterior
+  let anterior = null;
+  for (const r of resultados) {
+    const marca = r.esActual ? ' <i>(en curso)</i>' : '';
+    let diffStr = '';
+    if (anterior !== null && anterior > 0) {
+      const diff = ((r.gastos - anterior) / anterior) * 100;
+      const signo = diff >= 0 ? '+' : '';
+      const emoji = diff > 10 ? '📈' : diff < -10 ? '📉' : '➡️';
+      diffStr = ` ${emoji} ${signo}${diff.toFixed(0)}%`;
+    }
+    msg += `<b>${r.nombreMes}:</b> $${fmt(r.gastos)}${diffStr}${marca}\n`;
+    if (!r.esActual) anterior = r.gastos;
+  }
+
+  // Promedio de los meses cerrados
+  const cerrados = resultados.filter(r => !r.esActual);
+  if (cerrados.length > 0) {
+    const prom = cerrados.reduce((a, r) => a + r.gastos, 0) / cerrados.length;
+    msg += `\n<b>Promedio (${cerrados.length} meses cerrados):</b> $${fmt(prom)}\n`;
+
+    // Proyección del mes actual
+    const actual = resultados.find(r => r.esActual);
+    if (actual && actual.gastos > 0) {
+      const diaHoy = Number(hoy.slice(8, 10));
+      const ultimoDia = new Date(añoHoy, mesHoy, 0).getDate();
+      const proyeccion = (actual.gastos / diaHoy) * ultimoDia;
+      msg += `\n📊 <b>Proyección del mes actual:</b> $${fmt(proyeccion)}\n`;
+      msg += `   (ritmo de $${fmt(actual.gastos / diaHoy)}/día)`;
     }
   }
 
@@ -703,7 +912,6 @@ async function handleRevisar(env, chatId, offset = 0) {
 
   const rows = await leerMovimientos(env, desde, hoy, true);
 
-  // Filtrar sospechosos
   const sospechosos = rows.filter(({ data: r }) => {
     const rubro = r[6] || '';
     const desc = r[8] || '';
@@ -837,6 +1045,12 @@ async function handleMensaje(env, msg) {
   if (texto.startsWith('/saldo')) return handleSaldo(env, chatId);
   if (texto.startsWith('/resumen')) return handleResumen(env, chatId);
   if (texto.startsWith('/mes')) return handleMes(env, chatId);
+  if (texto.startsWith('/rubro')) {
+    const resto = texto.replace('/rubro', '').trim();
+    return handleRubro(env, chatId, resto);
+  }
+  if (texto.startsWith('/metodos')) return handleMetodos(env, chatId);
+  if (texto.startsWith('/tendencia')) return handleTendencia(env, chatId);
   if (texto.startsWith('/hoy')) return handleHoy(env, chatId);
   if (texto.startsWith('/semana')) return handleSemana(env, chatId);
   if (texto.startsWith('/presupuesto')) return handlePresupuesto(env, chatId);
