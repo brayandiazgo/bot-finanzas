@@ -87,7 +87,7 @@ export function tecladoRubros(fila, rubros) {
   return { inline_keyboard: filas };
 }
 
-const MEDIOS = ['Efectivo', 'Nequi', 'Transferencia', 'Debito', 'Credito'];
+const MEDIOS = ['Efectivo', 'Transferencia', 'Debito'];
 
 export function tecladoMedios(fila) {
   const botones = MEDIOS.map((m) => ({

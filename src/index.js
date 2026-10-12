@@ -14,10 +14,12 @@ import {
   leerPresupuestoMes, parsearValor, normalizarFecha,
   limpiarBorradoresViejos, listarMovimientos, listarBorradores,
   obtenerMsgIdsBorradores,
+  leerAprendizaje, guardarAprendizaje, reemplazarAprendizaje,
 } from './sheets.js';
 
 const TOPE_VALOR = 1000000;
 const MAX_BORRADORES = 5;
+const UMBRAL_APRENDIZAJE = 2;
 
 const RUBROS_KEYWORDS = {
   'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada'],
@@ -39,7 +41,7 @@ const RUBROS_KEYWORDS = {
   'Ingreso extra': ['venta', 'iphone', 'impresion', 'copias', 'cuota computador'],
 };
 
-function categorizar(texto) {
+function categorizarBasico(texto) {
   const t = texto.toLowerCase();
   const matches = [];
   for (const [rubro, keys] of Object.entries(RUBROS_KEYWORDS)) {
@@ -47,9 +49,55 @@ function categorizar(texto) {
       if (t.includes(k)) matches.push({ rubro, len: k.length });
     }
   }
-  if (matches.length === 0) return 'Otro';
+  if (matches.length === 0) return null;
   matches.sort((a, b) => b.len - a.len);
   return matches[0].rubro;
+}
+
+function normalizar(t) {
+  return String(t || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\w\s]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function primeraPalabra(desc) {
+  const n = normalizar(desc);
+  const partes = n.split(' ');
+  return partes[0] || '';
+}
+
+async function categorizarConAprendizaje(env, desc) {
+  const directo = categorizarBasico(desc);
+  if (directo) return { rubro: directo, fuente: 'diccionario' };
+
+  const aprend = await leerAprendizaje(env);
+  const descNorm = normalizar(desc);
+  const primera = primeraPalabra(desc);
+
+  const exacta = aprend.find(a => a.tipo === 'descripcion' && a.palabra === descNorm && a.veces >= UMBRAL_APRENDIZAJE);
+  if (exacta) return { rubro: exacta.rubro, fuente: 'aprendizaje-desc' };
+
+  const porPrimera = aprend.find(a => a.tipo === 'palabra' && a.palabra === primera && a.veces >= UMBRAL_APRENDIZAJE);
+  if (porPrimera) return { rubro: porPrimera.rubro, fuente: 'aprendizaje-palabra' };
+
+  return { rubro: 'Otro', fuente: 'ninguna' };
+}
+
+async function aprenderDeCorreccion(env, descripcion, rubroNuevo) {
+  try {
+    const descNorm = normalizar(descripcion);
+    const primera = primeraPalabra(descripcion);
+    await guardarAprendizaje(env, descNorm, rubroNuevo, 'descripcion');
+    if (primera && primera !== descNorm && primera.length >= 3) {
+      await guardarAprendizaje(env, primera, rubroNuevo, 'palabra');
+    }
+  } catch (e) {
+    console.error('Error aprendiendo:', e.message);
+  }
 }
 
 function hoyColombia() {
@@ -96,13 +144,12 @@ function parsearGasto(texto) {
 }
 
 function extraerMedio(desc) {
-  const medios = ['efectivo', 'debito', 'débito', 'credito', 'crédito', 'transferencia', 'nequi'];
+  const medios = ['efectivo', 'debito', 'débito', 'transferencia'];
   for (const md of medios) {
     if (desc.toLowerCase().endsWith(' ' + md)) {
       let medio = md.charAt(0).toUpperCase() + md.slice(1);
       medio = medio.replace('é', 'e');
       if (medio === 'Débito') medio = 'Debito';
-      if (medio === 'Crédito') medio = 'Credito';
       return { medio, desc: desc.slice(0, -(md.length + 1)).trim() };
     }
   }
@@ -159,8 +206,7 @@ function textoBorrador(fecha, rubro, valor, desc, medio) {
   );
 }
 
-// Borra del chat todos los mensajes de borradores en `pendiente` excepto el que estamos creando
-async function borrarMensajesDeBorradoresViejos(env, chatId, exceptoFila) {
+async function borrarMensajesDeBorradoresViejos(env, chatId) {
   try {
     const msgIds = await obtenerMsgIdsBorradores(env);
     for (const msgId of msgIds) {
@@ -169,6 +215,87 @@ async function borrarMensajesDeBorradoresViejos(env, chatId, exceptoFila) {
   } catch (e) {
     console.error('Error borrando mensajes viejos:', e.message);
   }
+}
+
+// ---------- CÁLCULO DE RESUMEN ----------
+
+async function calcularResumen(env) {
+  const hoy = hoyColombia();
+  const año = Number(hoy.slice(0, 4));
+  const mesNum = Number(hoy.slice(5, 7));
+  const mesIni = hoy.slice(0, 7) + '-01';
+  const diaHoy = Number(hoy.slice(8, 10));
+
+  const ultimoDia = new Date(año, mesNum, 0).getDate();
+  const diasRestantes = ultimoDia - diaHoy + 1;
+
+  const rows = await leerMovimientos(env, mesIni, hoy, true);
+  let gastos = 0, ingresos = 0;
+  const porRubro = {};
+  for (const { data: r } of rows) {
+    const tipo = r[10];
+    const valor = parsearValor(r[7]);
+    const rubro = r[6] || 'Otro';
+    if (tipo === 'Gasto') {
+      gastos += valor;
+      porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(valor);
+    } else if (tipo === 'Ingreso') ingresos += valor;
+  }
+
+  const presupuesto = await leerPresupuestoMes(env, año, mesNum);
+  const presupuestoMap = {};
+  for (const p of presupuesto) presupuestoMap[p.rubro] = p.monto;
+  const totalPresupuesto = presupuesto.reduce((a, p) => a + p.monto, 0);
+
+  const rubrosConDatos = [];
+  for (const p of presupuesto) {
+    if (p.monto <= 0) continue;
+    const gastado = Math.abs(porRubro[p.rubro] || 0);
+    const disponible = p.monto - gastado;
+    const pct = p.monto > 0 ? (gastado / p.monto) * 100 : 0;
+    rubrosConDatos.push({ rubro: p.rubro, monto: p.monto, gastado, disponible, pct });
+  }
+
+  const topAjustados = rubrosConDatos
+    .filter(r => r.pct >= 50)
+    .sort((a, b) => b.pct - a.pct)
+    .slice(0, 3);
+
+  const totalGastadoAbs = Math.abs(gastos);
+  const totalDisponible = totalPresupuesto - totalGastadoAbs;
+  const pctTotal = totalPresupuesto > 0 ? (totalGastadoAbs / totalPresupuesto) * 100 : 0;
+
+  return {
+    diaHoy, diasRestantes, mesNum,
+    totalPresupuesto, totalGastadoAbs, totalDisponible, pctTotal,
+    topAjustados,
+  };
+}
+
+function mensajeResumen(data) {
+  const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+  const mesNombre = MESES[data.mesNum - 1];
+
+  let msg = `☀️ <b>Buenos días Brayan</b>\n\n`;
+  msg += `📅 Quedan <b>${data.diasRestantes}</b> días de ${mesNombre}\n\n`;
+
+  if (data.totalPresupuesto > 0) {
+    msg += `💰 <b>Disponible:</b> $${fmt(data.totalDisponible)}\n`;
+    msg += `   (has usado ${data.pctTotal.toFixed(0)}% del presupuesto)\n\n`;
+  }
+
+  if (data.topAjustados.length > 0) {
+    msg += `<b>Rubros más ajustados:</b>\n`;
+    for (const r of data.topAjustados) {
+      const icono = r.pct > 100 ? '🔴' : r.pct >= 80 ? '🟡' : '🟢';
+      msg += `${icono} <b>${r.rubro}</b>: $${fmt(r.disponible)} disponibles\n`;
+      msg += `   (gastaste $${fmt(r.gastado)} de $${fmt(r.monto)})\n`;
+    }
+  } else {
+    msg += `✅ Todo en orden, no hay rubros críticos.\n`;
+  }
+
+  return msg;
 }
 
 // ---------- HANDLERS ----------
@@ -182,6 +309,7 @@ async function handleStart(env, chatId) {
     `• <code>18000 gasolina debito</code>\n\n` +
     `<b>Consultas:</b>\n` +
     `/saldo — balance y presupuesto del mes\n` +
+    `/resumen — el mismo resumen que llega en la mañana\n` +
     `/mes — resumen por rubro\n` +
     `/hoy — movimientos de hoy\n` +
     `/semana — últimos 7 días\n` +
@@ -193,8 +321,19 @@ async function handleStart(env, chatId) {
     `/borrar N — eliminar el movimiento N\n` +
     `/valor N 5000 — cambiar el monto\n` +
     `/desc N texto — cambiar la descripción\n\n` +
+    `<b>Aprendizaje:</b>\n` +
+    `/aprender — cargar aprendizaje desde el histórico\n` +
+    `/aprendizaje — ver la tabla de aprendizaje\n\n` +
     `/ayuda`
   );
+}
+
+async function handleResumen(env, chatId) {
+  const data = await calcularResumen(env);
+  if (data.totalPresupuesto === 0) {
+    return enviar(env, chatId, '📭 No hay presupuesto cargado para este mes.');
+  }
+  return enviar(env, chatId, mensajeResumen(data));
 }
 
 async function handleRegistrar(env, chatId, monto, desc, medio) {
@@ -205,7 +344,7 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     );
   }
 
-  const rubro = categorizar(desc);
+  const { rubro, fuente } = await categorizarConAprendizaje(env, desc);
   const fecha = hoyColombia();
 
   const dup = await buscarDuplicado(env, desc, monto);
@@ -219,7 +358,6 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     );
   }
 
-  // Primero: borra los mensajes de borradores viejos del chat (pero NO las filas)
   await borrarMensajesDeBorradoresViejos(env, chatId);
 
   const medioFinal = medio || 'Efectivo';
@@ -228,9 +366,15 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     tipo: 'Gasto', fuente: 'manual', estado: 'pendiente',
   });
 
+  const emojiFuente = fuente === 'diccionario' ? '📚'
+    : fuente === 'aprendizaje-desc' ? '🎓'
+    : fuente === 'aprendizaje-palabra' ? '🎓'
+    : '❓';
+
   const msgResp = await enviar(env, chatId,
     `🕒 <b>Borrador</b> (fila ${fila})\n` +
     textoBorrador(fecha, rubro, -monto, desc, medioFinal) +
+    `\n\n${emojiFuente} Categorizado por: <i>${fuente}</i>` +
     `\n\nPresiona ✅ para guardar:`,
     { reply_markup: tecladoBorrador(fila) }
   );
@@ -435,8 +579,6 @@ async function handleEditar(env, chatId, fila) {
   if (r[10] !== 'Gasto') return enviar(env, chatId, `❌ Solo puedo editar gastos. Esta fila es un ${r[10]}.`);
 
   await actualizarEstado(env, fila, 'pendiente');
-
-  // Borra los mensajes de borradores viejos, así solo queda el nuevo abajo
   await borrarMensajesDeBorradoresViejos(env, chatId);
 
   const msgResp = await enviar(env, chatId,
@@ -533,6 +675,94 @@ async function handleDesc(env, chatId, texto) {
   return enviar(env, chatId, `✅ Fila ${fila} → "${nuevaDesc}"`);
 }
 
+async function handleAprender(env, chatId) {
+  await enviar(env, chatId, `🧠 Analizando tu histórico para aprender patrones... (puede tardar 10 segundos)`);
+
+  const hoy = hoyColombia();
+  const hace3m = new Date();
+  hace3m.setMonth(hace3m.getMonth() - 3);
+  const desde = hace3m.toISOString().slice(0, 10);
+
+  const rows = await leerMovimientos(env, desde, hoy, true);
+
+  const conteoDesc = {};
+  const conteoPalabra = {};
+
+  for (const { data: r } of rows) {
+    if (r[10] !== 'Gasto') continue;
+    const desc = r[8] || '';
+    const rubro = r[6] || 'Otro';
+    if (!desc || !rubro) continue;
+
+    const descNorm = normalizar(desc);
+    const primera = primeraPalabra(desc);
+
+    const keyD = `${descNorm}||${rubro}`;
+    conteoDesc[keyD] = (conteoDesc[keyD] || 0) + 1;
+
+    if (primera && primera !== descNorm && primera.length >= 3) {
+      const keyP = `${primera}||${rubro}`;
+      conteoPalabra[keyP] = (conteoPalabra[keyP] || 0) + 1;
+    }
+  }
+
+  const datos = [];
+  for (const [key, veces] of Object.entries(conteoDesc)) {
+    if (veces < 2) continue;
+    const [palabra, rubro] = key.split('||');
+    datos.push({ palabra, rubro, veces, tipo: 'descripcion' });
+  }
+  for (const [key, veces] of Object.entries(conteoPalabra)) {
+    if (veces < 3) continue;
+    const [palabra, rubro] = key.split('||');
+    if (datos.some(d => d.palabra === palabra && d.tipo === 'palabra')) continue;
+    datos.push({ palabra, rubro, veces, tipo: 'palabra' });
+  }
+
+  datos.sort((a, b) => b.veces - a.veces);
+
+  if (datos.length === 0) {
+    return enviar(env, chatId, `📭 No encontré patrones suficientes en tu histórico.`);
+  }
+
+  await reemplazarAprendizaje(env, datos);
+
+  const porRubro = {};
+  for (const d of datos) {
+    porRubro[d.rubro] = (porRubro[d.rubro] || 0) + 1;
+  }
+
+  let msg = `🧠 <b>Aprendizaje actualizado</b>\n\n` +
+    `Aprendí <b>${datos.length}</b> patrones de tus últimos 3 meses.\n\n` +
+    `<b>Por rubro:</b>\n`;
+  for (const [rubro, cant] of Object.entries(porRubro).sort((a, b) => b[1] - a[1])) {
+    msg += `• ${rubro}: ${cant} patrones\n`;
+  }
+  msg += `\nUsa /aprendizaje para ver la tabla completa.`;
+
+  return enviar(env, chatId, msg);
+}
+
+async function handleVerAprendizaje(env, chatId) {
+  const datos = await leerAprendizaje(env);
+  if (datos.length === 0) {
+    return enviar(env, chatId, `📭 No hay aprendizaje todavía. Usa /aprender para cargar desde tu histórico.`);
+  }
+
+  const ordenados = [...datos].sort((a, b) => b.veces - a.veces).slice(0, 30);
+
+  let msg = `🎓 <b>Aprendizaje</b> (${datos.length} patrones)\n\n`;
+  for (const d of ordenados) {
+    const icono = d.tipo === 'descripcion' ? '📝' : '🔑';
+    msg += `${icono} <b>${d.palabra}</b> → ${d.rubro} <i>(${d.veces}x)</i>\n`;
+  }
+  if (datos.length > 30) {
+    msg += `\n<i>... y ${datos.length - 30} más</i>`;
+  }
+
+  return enviar(env, chatId, msg);
+}
+
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
@@ -543,12 +773,15 @@ async function handleMensaje(env, msg) {
 
   if (texto.startsWith('/start') || texto.startsWith('/ayuda')) return handleStart(env, chatId);
   if (texto.startsWith('/saldo')) return handleSaldo(env, chatId);
+  if (texto.startsWith('/resumen')) return handleResumen(env, chatId);
   if (texto.startsWith('/mes')) return handleMes(env, chatId);
   if (texto.startsWith('/hoy')) return handleHoy(env, chatId);
   if (texto.startsWith('/semana')) return handleSemana(env, chatId);
   if (texto.startsWith('/presupuesto')) return handlePresupuesto(env, chatId);
   if (texto.startsWith('/listar')) return handleListar(env, chatId, 0);
   if (texto.startsWith('/borradores')) return handleBorradores(env, chatId);
+  if (texto.startsWith('/aprender')) return handleAprender(env, chatId);
+  if (texto.startsWith('/aprendizaje')) return handleVerAprendizaje(env, chatId);
 
   if (texto.startsWith('/editar')) {
     const m = texto.match(/^\/editar\s+(\d+)/);
@@ -686,7 +919,11 @@ async function handleCallback(env, cq) {
   if (accion === 'setrubro') {
     const fila = Number(params[0]);
     const nuevoRubro = params.slice(1).join(':');
+    const rAntes = await leerMovimientoPorFila(env, fila);
     await actualizarRubro(env, fila, nuevoRubro);
+    if (rAntes && rAntes[8] && rAntes[6] !== nuevoRubro) {
+      await aprenderDeCorreccion(env, rAntes[8], nuevoRubro);
+    }
     const r = await leerMovimientoPorFila(env, fila);
     return editarMensaje(env, chatId, messageId,
       `🕒 <b>Borrador</b> (fila ${fila})\n` +
@@ -735,7 +972,7 @@ async function handleCallback(env, cq) {
     const monto = Number(params[0]);
     const matchDesc = cq.message.text.match(/intentas: <b>\$[\d.]+<\/b> — (.+)/);
     const desc = matchDesc ? matchDesc[1].trim() : 'Gasto manual';
-    const rubro = categorizar(desc);
+    const { rubro } = await categorizarConAprendizaje(env, desc);
     const fecha = hoyColombia();
     const fila = await appendMovimiento(env, {
       fecha, rubro, valor: -monto, descripcion: desc, medio: 'Efectivo',
@@ -780,8 +1017,20 @@ export default {
 
   async scheduled(event, env, ctx) {
     try {
-      if (event.cron === '0 12 1 * *') {
-        console.log('Cron mensual disparado:', new Date().toISOString());
+      if (event.cron === '0 11 * * *') {
+        const chatId = env.TELEGRAM_CHAT_ID;
+        const data = await calcularResumen(env);
+        if (data.totalPresupuesto > 0) {
+          await enviar(env, chatId, mensajeResumen(data));
+        }
+      } else if (event.cron === '0 12 1 * *') {
+        console.log('Cron mensual disparado (reservado C.5):', new Date().toISOString());
+      } else if (event.cron === '0 23 28-31 * *') {
+        const hoyCol = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
+        const ultimoDia = new Date(hoyCol.getFullYear(), hoyCol.getMonth() + 1, 0).getDate();
+        if (hoyCol.getDate() === ultimoDia) {
+          console.log('Último día del mes (reservado C.5):', new Date().toISOString());
+        }
       } else if (event.cron === '*/30 * * * *') {
         const resultado = await limpiarBorradoresViejos(env);
         console.log(`Limpieza de borradores: ${resultado.borradas} filas borradas`);

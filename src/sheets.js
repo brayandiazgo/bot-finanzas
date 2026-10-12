@@ -304,7 +304,6 @@ export async function listarBorradores(env) {
   return resultado;
 }
 
-// Devuelve la lista de msg_id de todos los borradores en la hoja
 export async function obtenerMsgIdsBorradores(env) {
   const data = await sheetsRequest(
     env,
@@ -349,4 +348,99 @@ export async function limpiarBorradoresViejos(env) {
     }
   }
   return { borradas, msgs };
+}
+
+// ---------- APRENDIZAJE ----------
+
+export async function leerAprendizaje(env) {
+  try {
+    const data = await sheetsRequest(
+      env,
+      `/values/APRENDIZAJE!A:E?valueRenderOption=FORMATTED_VALUE`
+    );
+    const rows = data.values || [];
+    const resultado = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r[0]) continue;
+      resultado.push({
+        fila: i + 1,
+        palabra: String(r[0]).toLowerCase().trim(),
+        rubro: r[1] || '',
+        veces: Number(r[2] || 0),
+        tipo: r[3] || 'palabra',
+        actualizado: r[4] || '',
+      });
+    }
+    return resultado;
+  } catch (e) {
+    if (String(e.message).includes('Unable to parse range')) return [];
+    throw e;
+  }
+}
+
+export async function guardarAprendizaje(env, palabra, rubro, tipo) {
+  const hoy = new Date().toISOString().slice(0, 10);
+  const existentes = await leerAprendizaje(env);
+  const existente = existentes.find(a => a.palabra === palabra.toLowerCase().trim() && a.tipo === tipo);
+
+  if (existente) {
+    await sheetsRequest(env, `/values/APRENDIZAJE!C${existente.fila}:E${existente.fila}?valueInputOption=USER_ENTERED`, {
+      method: 'PUT',
+      body: JSON.stringify({ values: [[existente.veces + 1, tipo, hoy]] }),
+    });
+    if (existente.rubro !== rubro) {
+      await sheetsRequest(env, `/values/APRENDIZAJE!B${existente.fila}?valueInputOption=USER_ENTERED`, {
+        method: 'PUT',
+        body: JSON.stringify({ values: [[rubro]] }),
+      });
+    }
+    return existente.fila;
+  }
+
+  const data = await sheetsRequest(env, `/values/APRENDIZAJE!A:E`);
+  const fila = (data.values || []).length + 1;
+  await sheetsRequest(env, `/values/APRENDIZAJE!A${fila}:E${fila}?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    body: JSON.stringify({ values: [[palabra.toLowerCase().trim(), rubro, 1, tipo, hoy]] }),
+  });
+  return fila;
+}
+
+export async function reemplazarAprendizaje(env, datos) {
+  const meta = await sheetsRequest(env, `?fields=sheets.properties`);
+  const sheet = meta.sheets.find(s => s.properties.title === 'APRENDIZAJE');
+  if (!sheet) throw new Error('No existe hoja APRENDIZAJE');
+  const sheetId = sheet.properties.sheetId;
+
+  const existentes = await sheetsRequest(env, `/values/APRENDIZAJE!A:E`);
+  const totalFilas = (existentes.values || []).length;
+  if (totalFilas > 1) {
+    await sheetsRequest(env, `:batchUpdate`, {
+      method: 'POST',
+      body: JSON.stringify({
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: 'ROWS',
+              startIndex: 1,
+              endIndex: totalFilas,
+            },
+          },
+        }],
+      }),
+    });
+  }
+
+  if (datos.length > 0) {
+    const filas = datos.map(d => [
+      d.palabra, d.rubro, d.veces, d.tipo,
+      new Date().toISOString().slice(0, 10),
+    ]);
+    await sheetsRequest(env, `/values/APRENDIZAJE!A2:E${datos.length + 1}?valueInputOption=USER_ENTERED`, {
+      method: 'PUT',
+      body: JSON.stringify({ values: filas }),
+    });
+  }
 }
