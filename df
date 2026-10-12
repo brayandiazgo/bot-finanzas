@@ -1,0 +1,477 @@
+[1mdiff --git a/src/sheets.js b/src/sheets.js[m
+[1mindex 4fef956..60f2373 100644[m
+[1m--- a/src/sheets.js[m
+[1m+++ b/src/sheets.js[m
+[36m@@ -1,446 +1,33 @@[m
+[31m-// src/sheets.js[m
+[31m-let cachedToken = null;[m
+[31m-let cachedTokenExp = 0;[m
+[31m-[m
+[31m-function base64url(input) {[m
+[31m-  const bytes = typeof input === 'string'[m
+[31m-    ? new TextEncoder().encode(input)[m
+[31m-    : new Uint8Array(input);[m
+[31m-  let str = '';[m
+[31m-  for (const b of bytes) str += String.fromCharCode(b);[m
+[31m-  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');[m
+[31m-}[m
+[31m-[m
+[31m-function pemToArrayBuffer(pem) {[m
+[31m-  const b64 = pem[m
+[31m-    .replace(/-----BEGIN PRIVATE KEY-----/, '')[m
+[31m-    .replace(/-----END PRIVATE KEY-----/, '')[m
+[31m-    .replace(/\s+/g, '');[m
+[31m-  const raw = atob(b64);[m
+[31m-  const buf = new Uint8Array(raw.length);[m
+[31m-  for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);[m
+[31m-  return buf.buffer;[m
+[31m-}[m
+[31m-[m
+[31m-async function getAccessToken(env) {[m
+[31m-  const now = Math.floor(Date.now() / 1000);[m
+[31m-  if (cachedToken && now < cachedTokenExp - 60) return cachedToken;[m
+[31m-[m
+[31m-  const sa = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT_JSON);[m
+[31m-  const header = { alg: 'RS256', typ: 'JWT' };[m
+[31m-  const claim = {[m
+[31m-    iss: sa.client_email,[m
+[31m-    scope: 'https://www.googleapis.com/auth/spreadsheets',[m
+[31m-    aud: 'https://oauth2.googleapis.com/token',[m
+[31m-    exp: now + 3600,[m
+[31m-    iat: now,[m
+[31m-  };[m
+[31m-  const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claim))}`;[m
+[31m-  const key = await crypto.subtle.importKey([m
+[31m-    'pkcs8',[m
+[31m-    pemToArrayBuffer(sa.private_key),[m
+[31m-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },[m
+[31m-    false,[m
+[31m-    ['sign'][m
+[31m-  );[m
+[31m-  const sig = await crypto.subtle.sign([m
+[31m-    'RSASSA-PKCS1-v1_5',[m
+[31m-    key,[m
+[31m-    new TextEncoder().encode(unsigned)[m
+[31m-  );[m
+[31m-  const jwt = `${unsigned}.${base64url(sig)}`;[m
+[31m-[m
+[31m-  const res = await fetch('https://oauth2.googleapis.com/token', {[m
+[31m-    method: 'POST',[m
+[31m-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },[m
+[31m-    body: new URLSearchParams({[m
+[31m-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',[m
+[31m-      assertion: jwt,[m
+[31m-    }),[m
+[31m-  });[m
+[31m-  const data = await res.json();[m
+[31m-  if (!data.access_token) throw new Error('No access_token: ' + JSON.stringify(data));[m
+[31m-  cachedToken = data.access_token;[m
+[31m-  cachedTokenExp = now + 3600;[m
+[31m-  return cachedToken;[m
+[31m-}[m
+[31m-[m
+[31m-async function sheetsRequest(env, path, options = {}) {[m
+[31m-  const token = await getAccessToken(env);[m
+[31m-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${env.SPREADSHEET_ID}${path}`;[m
+[31m-  const res = await fetch(url, {[m
+[31m-    ...options,[m
+[31m-    headers: {[m
+[31m-      Authorization: `Bearer ${token}`,[m
+[31m-      'Content-Type': 'application/json',[m
+[31m-      ...(options.headers || {}),[m
+[31m-    },[m
+[31m-  });[m
+[31m-  const text = await res.text();[m
+[31m-  let data;[m
+[31m-  try { data = JSON.parse(text); } catch { data = { raw: text }; }[m
+[31m-  if (!res.ok) throw new Error(`Sheets ${res.status}: ${JSON.stringify(data)}`);[m
+[31m-  return data;[m
+[31m-}[m
+[31m-[m
+[31m-async function obtenerSiguienteFila(env) {[m
+[31m-  const data = await sheetsRequest(env, `/values/MOVIMIENTOS!B:B`);[m
+[31m-  const rows = data.values || [];[m
+[31m-  let ultimaConDato = 1;[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    if (rows[i] && rows[i][0]) ultimaConDato = i + 1;[m
+[31m-  }[m
+[31m-  return ultimaConDato + 1;[m
+[31m-}[m
+[31m-[m
+[31m-function formulasFila(fila) {[m
+[31m-  const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];[m
+[31m-  const DIAS = ['lunes','martes','miércoles','jueves','viernes','sábado','domingo'];[m
+[31m-  return {[m
+[31m-    A: `=SI(B${fila}<>"";FILA()-1;"")`,[m
+[31m-    C: `=SI(B${fila}<>"";AÑO(B${fila});"")`,[m
+[31m-    D: `=SI(B${fila}<>"";MES(B${fila});"")`,[m
+[31m-    E: `=SI(B${fila}<>"";ELEGIR(MES(B${fila});${MESES.map(m => `"${m}"`).join(';')});"")`,[m
+[31m-    F: `=SI(B${fila}<>"";ELEGIR(DIASEM(B${fila};2);${DIAS.map(d => `"${d}"`).join(';')});"")`,[m
+[31m-  };[m
+[31m-}[m
+[31m-[m
+[31m-export async function appendMovimiento(env, mov) {[m
+[31m-  const fila = await obtenerSiguienteFila(env);[m
+[31m-  const f = formulasFila(fila);[m
+[31m-[m
+[31m-  const valores = [[[m
+[31m-    f.A, mov.fecha, f.C, f.D, f.E, f.F,[m
+[31m-    mov.rubro, mov.valor, mov.descripcion || '', mov.medio || 'Efectivo',[m
+[31m-    mov.tipo, mov.fuente || 'manual', mov.estado || 'pendiente',[m
+[31m-    mov.id_correo || '', mov.nota || '', '',[m
+[31m-  ]];[m
+[31m-[m
+[31m-  await sheetsRequest(env, `/values/MOVIMIENTOS!A${fila}:P${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: valores }),[m
+[31m-  });[m
+[31m-[m
+[31m-  return fila;[m
+[31m-}[m
+[31m-[m
+[31m-export async function actualizarRubro(env, fila, rubro) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!G${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[rubro]] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function actualizarMedio(env, fila, medio) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!J${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[medio]] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function actualizarEstado(env, fila, estado) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!M${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[estado]] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function actualizarValor(env, fila, valor) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!H${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[valor]] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function actualizarDescripcion(env, fila, desc) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!I${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[desc]] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function guardarMsgId(env, fila, msgId) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[msgId]] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function limpiarMsgId(env, fila) {[m
+[31m-  return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [['']] }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export async function borrarFila(env, fila) {[m
+[31m-  const meta = await sheetsRequest(env, `?fields=sheets.properties`);[m
+[31m-  const sheet = meta.sheets.find(s => s.properties.title === 'MOVIMIENTOS');[m
+[31m-  if (!sheet) throw new Error('No se encontró la hoja MOVIMIENTOS');[m
+[31m-  const sheetId = sheet.properties.sheetId;[m
+[31m-[m
+[31m-  return sheetsRequest(env, `:batchUpdate`, {[m
+[31m-    method: 'POST',[m
+[31m-    body: JSON.stringify({[m
+[31m-      requests: [{[m
+[31m-        deleteDimension: {[m
+[31m-          range: {[m
+[31m-            sheetId,[m
+[31m-            dimension: 'ROWS',[m
+[31m-            startIndex: fila - 1,[m
+[31m-            endIndex: fila,[m
+[31m-          },[m
+[31m-        },[m
+[31m-      }],[m
+[31m-    }),[m
+[31m-  });[m
+[31m-}[m
+[31m-[m
+[31m-export function normalizarFecha(v) {[m
+[31m-  if (!v) return '';[m
+[31m-  const s = String(v);[m
+[31m-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);[m
+[31m-  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);[m
+[31m-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;[m
+[31m-  if (!isNaN(Number(s)) && Number(s) > 10000) {[m
+[31m-    const ms = (Number(s) - 25569) * 86400 * 1000;[m
+[31m-    return new Date(ms).toISOString().slice(0, 10);[m
+[31m-  }[m
+[31m-  return s.slice(0, 10);[m
+[31m-}[m
+[31m-[m
+[31m-export async function leerMovimientos(env, desde, hasta, soloConfirmados = false) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  const rows = data.values || [];[m
+[31m-  const resultado = [];[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    const r = rows[i];[m
+[31m-    if (!r || !r[1]) continue;[m
+[31m-    const fecha = normalizarFecha(r[1]);[m
+[31m-    if (fecha >= desde && fecha <= hasta) {[m
+[31m-      if (soloConfirmados && r[12] !== 'confirmado') continue;[m
+[31m-      resultado.push({ fila: i + 1, data: r });[m
+[32m+[m[32m// ============================================================[m
+[32m+[m[32m// C.6 — Leer IDs de correo ya registrados (columna N)[m
+[32m+[m[32m// ============================================================[m
+[32m+[m[32mexport async function leerIdsCorreosExistentes(env) {[m
+[32m+[m[32m  const sheet = await getSheet(env, "MOVIMIENTOS");[m
+[32m+[m[32m  const rows = await sheet.getRows();[m
+[32m+[m
+[32m+[m[32m  const ids = new Set();[m
+[32m+[m[32m  for (const row of rows) {[m
+[32m+[m[32m    const idCorreo = row.get("id_correo");[m
+[32m+[m[32m    if (idCorreo && String(idCorreo).trim() !== "") {[m
+[32m+[m[32m      ids.add(String(idCorreo).trim());[m
+     }[m
+   }[m
+[31m-  return resultado;[m
+[32m+[m[32m  return ids;[m
+ }[m
+ [m
+[31m-export async function leerMovimientoPorFila(env, fila) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/MOVIMIENTOS!A${fila}:P${fila}?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  return data.values?.[0] || null;[m
+[31m-}[m
+[32m+[m[32m// ============================================================[m
+[32m+[m[32m// C.6 — Guardar id_correo en la fila recién creada[m
+[32m+[m[32m// ============================================================[m
+[32m+[m[32mexport async function guardarIdCorreo(env, idMovimiento, idCorreo) {[m
+[32m+[m[32m  const sheet = await getSheet(env, "MOVIMIENTOS");[m
+[32m+[m[32m  const rows = await sheet.getRows();[m
+ [m
+[31m-export function parsearValor(v) {[m
+[31m-  const s = String(v || '0').replace(/[.,]/g, '');[m
+[31m-  const n = Number(s);[m
+[31m-  return isNaN(n) ? 0 : n;[m
+[31m-}[m
+[31m-[m
+[31m-export async function leerPresupuestoMes(env, año, mesNum) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/PRESUPUESTO!A:D?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  const rows = data.values || [];[m
+[31m-  const resultado = [];[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    const r = rows[i];[m
+[31m-    if (!r || r.length < 4) continue;[m
+[31m-    const añoRow = Number(r[0]);[m
+[31m-    const mesRow = Number(r[1]);[m
+[31m-    if (añoRow === año && mesRow === mesNum) {[m
+[31m-      const montoStr = String(r[3]).replace(/\./g, '').replace(',', '.');[m
+[31m-      const monto = Number(montoStr);[m
+[31m-      resultado.push({ rubro: r[2], monto: isNaN(monto) ? 0 : monto });[m
+[32m+[m[32m  for (const row of rows) {[m
+[32m+[m[32m    if (String(row.get("id")) === String(idMovimiento)) {[m
+[32m+[m[32m      row.set("id_correo", idCorreo);[m
+[32m+[m[32m      await row.save();[m
+[32m+[m[32m      return true;[m
+     }[m
+   }[m
+[31m-  return resultado;[m
+[31m-}[m
+[31m-[m
+[31m-export async function leerConfig(env) {[m
+[31m-  const data = await sheetsRequest(env, `/values/CONFIG!A1:B40`);[m
+[31m-  return data.values || [];[m
+[31m-}[m
+[31m-[m
+[31m-export async function listarMovimientos(env, limite, offset, incluirPendientes = false) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  const rows = data.values || [];[m
+[31m-  const validos = [];[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    const r = rows[i];[m
+[31m-    if (!r || !r[1]) continue;[m
+[31m-    if (!incluirPendientes && r[12] !== 'confirmado') continue;[m
+[31m-    validos.push({ fila: i + 1, data: r });[m
+[31m-  }[m
+[31m-  validos.reverse();[m
+[31m-  return {[m
+[31m-    total: validos.length,[m
+[31m-    items: validos.slice(offset, offset + limite),[m
+[31m-  };[m
+[31m-}[m
+[31m-[m
+[31m-export async function listarBorradores(env) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  const rows = data.values || [];[m
+[31m-  const resultado = [];[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    const r = rows[i];[m
+[31m-    if (!r || !r[1]) continue;[m
+[31m-    if (r[12] !== 'pendiente') continue;[m
+[31m-    resultado.push({ fila: i + 1, data: r });[m
+[31m-  }[m
+[31m-  return resultado;[m
+[31m-}[m
+[31m-[m
+[31m-export async function obtenerMsgIdsBorradores(env) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  const rows = data.values || [];[m
+[31m-  const msgs = [];[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    const r = rows[i];[m
+[31m-    if (!r || !r[12]) continue;[m
+[31m-    if (r[12] !== 'pendiente') continue;[m
+[31m-    if (r[15]) msgs.push(Number(r[15]));[m
+[31m-  }[m
+[31m-  return msgs;[m
+[31m-}[m
+[31m-[m
+[31m-export async function limpiarBorradoresViejos(env) {[m
+[31m-  const data = await sheetsRequest([m
+[31m-    env,[m
+[31m-    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`[m
+[31m-  );[m
+[31m-  const rows = data.values || [];[m
+[31m-  const aBorrar = [];[m
+[31m-[m
+[31m-  for (let i = 1; i < rows.length; i++) {[m
+[31m-    const r = rows[i];[m
+[31m-    if (!r || !r[12]) continue;[m
+[31m-    if (r[12] !== 'pendiente') continue;[m
+[31m-    aBorrar.push({ fila: i + 1, msgId: r[15] ? Number(r[15]) : null });[m
+[31m-  }[m
+[31m-[m
+[31m-  aBorrar.sort((a, b) => b.fila - a.fila);[m
+[31m-  let borradas = 0;[m
+[31m-  const msgs = [];[m
+[31m-  for (const { fila, msgId } of aBorrar) {[m
+[31m-    try {[m
+[31m-      await borrarFila(env, fila);[m
+[31m-      if (msgId) msgs.push(msgId);[m
+[31m-      borradas++;[m
+[31m-    } catch (e) {[m
+[31m-      console.error('Error borrando fila', fila, e.message);[m
+[31m-    }[m
+[31m-  }[m
+[31m-  return { borradas, msgs };[m
+[31m-}[m
+[31m-[m
+[31m-// ---------- APRENDIZAJE ----------[m
+[31m-[m
+[31m-export async function leerAprendizaje(env) {[m
+[31m-  try {[m
+[31m-    const data = await sheetsRequest([m
+[31m-      env,[m
+[31m-      `/values/APRENDIZAJE!A:E?valueRenderOption=FORMATTED_VALUE`[m
+[31m-    );[m
+[31m-    const rows = data.values || [];[m
+[31m-    const resultado = [];[m
+[31m-    for (let i = 1; i < rows.length; i++) {[m
+[31m-      const r = rows[i];[m
+[31m-      if (!r || !r[0]) continue;[m
+[31m-      resultado.push({[m
+[31m-        fila: i + 1,[m
+[31m-        palabra: String(r[0]).toLowerCase().trim(),[m
+[31m-        rubro: r[1] || '',[m
+[31m-        veces: Number(r[2] || 0),[m
+[31m-        tipo: r[3] || 'palabra',[m
+[31m-        actualizado: r[4] || '',[m
+[31m-      });[m
+[31m-    }[m
+[31m-    return resultado;[m
+[31m-  } catch (e) {[m
+[31m-    if (String(e.message).includes('Unable to parse range')) return [];[m
+[31m-    throw e;[m
+[31m-  }[m
+[31m-}[m
+[31m-[m
+[31m-export async function guardarAprendizaje(env, palabra, rubro, tipo) {[m
+[31m-  const hoy = new Date().toISOString().slice(0, 10);[m
+[31m-  const existentes = await leerAprendizaje(env);[m
+[31m-  const existente = existentes.find(a => a.palabra === palabra.toLowerCase().trim() && a.tipo === tipo);[m
+[31m-[m
+[31m-  if (existente) {[m
+[31m-    await sheetsRequest(env, `/values/APRENDIZAJE!C${existente.fila}:E${existente.fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-      method: 'PUT',[m
+[31m-      body: JSON.stringify({ values: [[existente.veces + 1, tipo, hoy]] }),[m
+[31m-    });[m
+[31m-    if (existente.rubro !== rubro) {[m
+[31m-      await sheetsRequest(env, `/values/APRENDIZAJE!B${existente.fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-        method: 'PUT',[m
+[31m-        body: JSON.stringify({ values: [[rubro]] }),[m
+[31m-      });[m
+[31m-    }[m
+[31m-    return existente.fila;[m
+[31m-  }[m
+[31m-[m
+[31m-  const data = await sheetsRequest(env, `/values/APRENDIZAJE!A:E`);[m
+[31m-  const fila = (data.values || []).length + 1;[m
+[31m-  await sheetsRequest(env, `/values/APRENDIZAJE!A${fila}:E${fila}?valueInputOption=USER_ENTERED`, {[m
+[31m-    method: 'PUT',[m
+[31m-    body: JSON.stringify({ values: [[palabra.toLowerCase().trim(), rubro, 1, tipo, hoy]] }),[m
+[31m-  });[m
+[31m-  return fila;[m
+[31m-}[m
+[31m-[m
+[31m-export async function reemplazarAprendizaje(env, datos) {[m
+[31m-  const meta = await sheetsRequest(env, `?fields=sheets.properties`);[m
+[31m-  const sheet = meta.sheets.find(s => s.properties.title === 'APRENDIZAJE');[m
+[31m-  if (!sheet) throw new Error('No existe hoja APRENDIZAJE');[m
+[31m-  const sheetId = sheet.properties.sheetId;[m
+[31m-[m
+[31m-  const existentes = await sheetsRequest(env, `/values/APRENDIZAJE!A:E`);[m
+[31m-  const totalFilas = (existentes.values || []).length;[m
+[31m-  if (totalFilas > 1) {[m
+[31m-    await sheetsRequest(env, `:batchUpdate`, {[m
+[31m-      method: 'POST',[m
+[31m-      body: JSON.stringify({[m
+[31m-        requests: [{[m
+[31m-          deleteDimension: {[m
+[31m-            range: {[m
+[31m-              sheetId,[m
+[31m-              dimension: 'ROWS',[m
+[31m-              startIndex: 1,[m
+[31m-              endIndex: totalFilas,[m
+[31m-            },[m
+[31m-          },[m
+[31m-        }],[m
+[31m-      }),[m
+[31m-    });[m
+[31m-  }[m
+[31m-[m
+[31m-  if (datos.length > 0) {[m
+[31m-    const filas = datos.map(d => [[m
+[31m-      d.palabra, d.rubro, d.veces, d.tipo,[m
+[31m-      new Date().toISOString().slice(0, 10),[m
+[31m-    ]);[m
+[31m-    await sheetsRequest(env, `/values/APRENDIZAJE!A2:E${datos.length + 1}?valueInputOption=USER_ENTERED`, {[m
+[31m-      method: 'PUT',[m
+[31m-      body: JSON.stringify({ values: filas }),[m
+[31m-    });[m
+[31m-  }[m
+[32m+[m[32m  return false;[m
+ }[m
+\ No newline at end of file[m

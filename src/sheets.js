@@ -344,7 +344,7 @@ export async function limpiarBorradoresViejos(env) {
       if (msgId) msgs.push(msgId);
       borradas++;
     } catch (e) {
-      console.error('Error borrando fila', fila, e.message);
+      console.log('Error borrando fila', fila, e.message);
     }
   }
   return { borradas, msgs };
@@ -443,4 +443,29 @@ export async function reemplazarAprendizaje(env, datos) {
       body: JSON.stringify({ values: filas }),
     });
   }
+}
+
+// ---------- C.6: IDs de correos ----------
+
+// Devuelve un Set con todos los id_correo ya registrados en MOVIMIENTOS (columna N)
+export async function leerIdsCorreosExistentes(env) {
+  const data = await sheetsRequest(
+    env,
+    `/values/MOVIMIENTOS!N:N?valueRenderOption=FORMATTED_VALUE`
+  );
+  const rows = data.values || [];
+  const ids = new Set();
+  for (let i = 1; i < rows.length; i++) {
+    const v = rows[i]?.[0];
+    if (v) ids.add(String(v));
+  }
+  return ids;
+}
+
+// Actualiza el id_correo de una fila (columna N)
+export async function actualizarIdCorreo(env, fila, idCorreo) {
+  return sheetsRequest(env, `/values/MOVIMIENTOS!N${fila}?valueInputOption=USER_ENTERED`, {
+    method: 'PUT',
+    body: JSON.stringify({ values: [[idCorreo]] }),
+  });
 }

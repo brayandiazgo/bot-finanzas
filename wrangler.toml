@@ -9,8 +9,9 @@ TZ = "America/Bogota"
 
 [triggers]
 crons = [
-  "0 11 * * *",         # 6:00 AM Colombia — resumen diario
-  "0 12 1 * *",         # 7:00 AM Colombia día 1 — análisis mensual (reservado C.5)
-  "0 23 28-31 * *",     # 6:00 PM Colombia último día del mes (reservado C.5)
-  "*/30 * * * *"        # cada 30 min — limpieza de borradores
+  "0 11 * * *",
+  "0 12 1 * *",
+  "0 23 28-31 * *",
+  "*/30 * * * *",
+  "*/15 * * * *"
 ]

@@ -152,3 +152,47 @@ export function tecladoRevisar(filas) {
   botones.push([{ text: '➡️ Siguientes', callback_data: 'revisar_siguientes' }]);
   return { inline_keyboard: botones };
 }
+
+// ---------- TECLADOS PARA CORREOS ----------
+
+// ---------- TECLADOS PARA CORREOS ----------
+
+export function tecladoCorreos(lista) {
+  const botones = [];
+  botones.push([
+    { text: '✅ Confirmar todos', callback_data: 'correos_confirmar_todos' },
+    { text: '❌ Ignorar todos', callback_data: 'correos_ignorar_todos' },
+  ]);
+  for (const c of lista) {
+    const emoji = c.esIngreso ? '➕' : '➖';
+    const monto = Math.round(c.monto).toLocaleString('es-CO');
+    botones.push([
+      { text: `${emoji} $${monto} — ${c.descripcion.slice(0, 25)}`, callback_data: `correo_ver:${c.fila}` },
+    ]);
+  }
+  return { inline_keyboard: botones };
+}
+
+export function tecladoCorreoIndividual(fila) {
+  return {
+    inline_keyboard: [
+      [{ text: '✅ Guardar', callback_data: `ok:${fila}` }],
+      [
+        { text: '💲 Valor', callback_data: `valor:${fila}` },
+        { text: '✏️ Rubro', callback_data: `rubro:${fila}` },
+      ],
+      [{ text: '🗑️ Descartar', callback_data: `cancelar:${fila}` }],
+    ],
+  };
+}
+
+export function tecladoResumenCorreos(cantidad) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Confirmar todos', callback_data: 'correos_confirmar_todos' },
+      { text: '🔍 Ver uno por uno', callback_data: 'correos_ver_individual' },
+    ], [
+      { text: '❌ Ignorar todos', callback_data: 'correos_ignorar_todos' },
+    ]],
+  };
+}

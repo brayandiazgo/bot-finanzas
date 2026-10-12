@@ -6,6 +6,7 @@ import {
   tecladoBorrarConfirmar, tecladoListado,
   tecladoConfirmarEliminar, tecladoBorradores,
   tecladoRevisar,
+  tecladoCorreos, tecladoCorreoIndividual, tecladoResumenCorreos,
 } from './telegram.js';
 import {
   appendMovimiento, leerMovimientos, leerMovimientoPorFila,
@@ -16,20 +17,25 @@ import {
   limpiarBorradoresViejos, listarMovimientos, listarBorradores,
   obtenerMsgIdsBorradores,
   leerAprendizaje, guardarAprendizaje, reemplazarAprendizaje,
+  leerIdsCorreosExistentes, actualizarIdCorreo,
 } from './sheets.js';
+import {
+  contarCorreosBancolombia, listarCorreosBancolombia, leerCorreo, verPrimerCorreo,
+} from './gmail.js';
+import { parsearCorreo } from './parser.js';
 
 const TOPE_VALOR = 1000000;
 const MAX_BORRADORES = 5;
 const UMBRAL_APRENDIZAJE = 2;
 
 const RUBROS_KEYWORDS = {
-  'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada'],
-  'Alimentación': ['almuerzo', 'desayuno', 'comida', 'rappi', 'domicilio', 'restaurante', 'cafe', 'pan', 'arepa', 'tostado', 'hamburguesa', 'pizza', 'oblea', 'mecato', 'helado', 'fresas', 'empanada', 'sandwich', 'leche', 'queso', 'tinto', 'caldo', 'cena'],
-  'Recibos': ['luz', 'agua', 'gas natural', 'internet', 'celular', 'tigo', 'icloud', 'energia', 'energía', 'aseo', 'papel higienico', 'recibo', 'plan de datos'],
+  'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada', 'otro gas', 'gas natural'],
+  'Alimentación': ['almuerzo', 'desayuno', 'comida', 'rappi', 'domicilio', 'restaurante', 'cafe', 'pan', 'arepa', 'tostado', 'hamburguesa', 'pizza', 'oblea', 'mecato', 'helado', 'fresas', 'empanada', 'sandwich', 'leche', 'queso', 'tinto', 'caldo', 'cena', 'mc donald', 'mcdonald'],
+  'Recibos': ['luz', 'agua', 'internet', 'celular', 'tigo', 'icloud', 'energia', 'energía', 'aseo', 'papel higienico', 'recibo', 'plan de datos'],
   'Transporte': ['uber', 'didi', 'taxi', 'bus', 'transmilenio', 'sitp', 'parqueadero', 'pasaje'],
   'Cuidado personal': ['corte de cabello', 'corte cabello', 'uña', 'espi', 'medicamento', 'zapatos', 'peluqueria'],
-  'Entretenimiento': ['spotify', 'youtube', 'apple', 'audifonos', 'cine', 'netflix', 'defensores de la fe'],
-  'Trading': ['fondeo', 'cuenta de trading', 'reto 100k', 'prueba de fondeo'],
+  'Entretenimiento': ['spotify', 'youtube', 'apple', 'audifonos', 'cine', 'netflix', 'defensores de la fe', 'youtube premium'],
+  'Trading': ['fondeo', 'cuenta de trading', 'reto 100k', 'prueba de fondeo', 'apex', 'apex trader funding'],
   'Casa': ['aporte casa', 'aporte papa', 'aporte papá', 'aseo casa'],
   'Pareja': ['fay', 'salida con fay', 'didi fay'],
   'Vida social': ['salida', 'fiesta', 'fresas con crema', 'cumpleaños', 'regalo amigo secreto'],
@@ -42,7 +48,6 @@ const RUBROS_KEYWORDS = {
   'Ingreso extra': ['venta', 'iphone', 'impresion', 'copias', 'cuota computador'],
 };
 
-// Lista de rubros según tu CONFIG (ya sin "Vida social / Pareja")
 const RUBROS_MENU = [
   'Diezmo', 'Ofrenda', 'Votos', 'Primicia', 'Casa', 'Prestamo', 'Recibos',
   'Alimentación', 'Gasolina', 'Pareja', 'Vida social', 'Regalo',
@@ -105,7 +110,7 @@ async function aprenderDeCorreccion(env, descripcion, rubroNuevo) {
       await guardarAprendizaje(env, primera, rubroNuevo, 'palabra');
     }
   } catch (e) {
-    console.error('Error aprendiendo:', e.message);
+    console.log('Error aprendiendo:', e.message);
   }
 }
 
@@ -217,7 +222,7 @@ async function borrarMensajesDeBorradoresViejos(env, chatId) {
       try { await borrarMensaje(env, chatId, msgId); } catch (e) { /* noop */ }
     }
   } catch (e) {
-    console.error('Error borrando mensajes viejos:', e.message);
+    console.log('Error borrando mensajes viejos:', e.message);
   }
 }
 
@@ -336,6 +341,8 @@ async function handleStart(env, chatId) {
     `/presupuesto — ver presupuesto del mes\n` +
     `/listar — últimos 10 movimientos\n` +
     `/borradores — borradores pendientes\n\n` +
+    `<b>Correos:</b>\n` +
+    `/correos — procesar correos nuevos del banco\n\n` +
     `<b>Editar:</b>\n` +
     `/editar N — modificar el movimiento N\n` +
     `/borrar N — eliminar el movimiento N\n` +
@@ -344,7 +351,10 @@ async function handleStart(env, chatId) {
     `<b>Mantenimiento:</b>\n` +
     `/revisar — movimientos con rubro "Otro" o sin descripción\n` +
     `/aprender — cargar aprendizaje desde el histórico\n` +
-    `/aprendizaje — ver la tabla de aprendizaje\n\n` +
+    `/aprendizaje — ver la tabla de aprendizaje\n` +
+    `/testcorreos — cuántos correos hay etiquetados\n` +
+    `/vercorreo — ver el body crudo del último correo\n` +
+    `/testparser — analizar los últimos 10 correos\n\n` +
     `/ayuda`
   );
 }
@@ -514,22 +524,12 @@ async function handleRubro(env, chatId, busqueda) {
     );
   }
 
-  // Buscar rubro por nombre parcial (case insensitive, sin acentos)
   const busqNorm = normalizar(busqueda);
   const rubrosNorm = RUBROS_MENU.map(r => ({ original: r, norm: normalizar(r) }));
 
-  // Primero: match exacto
   let rubroEncontrado = rubrosNorm.find(r => r.norm === busqNorm);
-
-  // Segundo: match parcial (empieza con)
-  if (!rubroEncontrado) {
-    rubroEncontrado = rubrosNorm.find(r => r.norm.startsWith(busqNorm));
-  }
-
-  // Tercero: contiene
-  if (!rubroEncontrado) {
-    rubroEncontrado = rubrosNorm.find(r => r.norm.includes(busqNorm));
-  }
+  if (!rubroEncontrado) rubroEncontrado = rubrosNorm.find(r => r.norm.startsWith(busqNorm));
+  if (!rubroEncontrado) rubroEncontrado = rubrosNorm.find(r => r.norm.includes(busqNorm));
 
   if (!rubroEncontrado) {
     return enviar(env, chatId,
@@ -582,7 +582,6 @@ async function handleRubro(env, chatId, busqueda) {
 
   if (movs.length > 0) {
     msg += `\n<b>Movimientos (${movs.length}):</b>\n`;
-    // Mostramos los últimos 10
     const ultimos = movs.slice(-10).reverse();
     for (const m of ultimos) {
       msg += `#${m.fila} ${m.fecha} — $${fmt(m.valor)} ${m.desc} <i>(${m.medio})</i>\n`;
@@ -641,7 +640,6 @@ async function handleTendencia(env, chatId) {
   const añoHoy = Number(hoy.slice(0, 4));
   const mesHoy = Number(hoy.slice(5, 7));
 
-  // Últimos 4 meses (incluyendo el actual)
   const meses = [];
   for (let i = 3; i >= 0; i--) {
     let m = mesHoy - i;
@@ -653,7 +651,6 @@ async function handleTendencia(env, chatId) {
   const resultados = [];
   for (const { año, mes } of meses) {
     const mesIni = `${año}-${String(mes).padStart(2, '0')}-01`;
-    // Último día del mes
     const ultimoDia = new Date(año, mes, 0).getDate();
     const mesFin = `${año}-${String(mes).padStart(2, '0')}-${String(ultimoDia).padStart(2, '0')}`;
     const finEfectivo = mesFin > hoy ? hoy : mesFin;
@@ -675,7 +672,6 @@ async function handleTendencia(env, chatId) {
 
   let msg = `📈 <b>Tendencia de gastos</b>\n\n`;
 
-  // Mostrar cada mes con % vs anterior
   let anterior = null;
   for (const r of resultados) {
     const marca = r.esActual ? ' <i>(en curso)</i>' : '';
@@ -690,13 +686,11 @@ async function handleTendencia(env, chatId) {
     if (!r.esActual) anterior = r.gastos;
   }
 
-  // Promedio de los meses cerrados
   const cerrados = resultados.filter(r => !r.esActual);
   if (cerrados.length > 0) {
     const prom = cerrados.reduce((a, r) => a + r.gastos, 0) / cerrados.length;
     msg += `\n<b>Promedio (${cerrados.length} meses cerrados):</b> $${fmt(prom)}\n`;
 
-    // Proyección del mes actual
     const actual = resultados.find(r => r.esActual);
     if (actual && actual.gastos > 0) {
       const diaHoy = Number(hoy.slice(8, 10));
@@ -868,7 +862,7 @@ async function handleValor(env, chatId, texto) {
           { reply_markup: tecladoBorrador(fila) }
         );
       }
-    } catch (e) { console.error('No pude refrescar:', e.message); }
+    } catch (e) { console.log('No pude refrescar:', e.message); }
   }
 
   return enviar(env, chatId, `✅ Fila ${fila} → valor <b>$${fmt(nuevoValor)}</b>`);
@@ -898,7 +892,7 @@ async function handleDesc(env, chatId, texto) {
           { reply_markup: tecladoBorrador(fila) }
         );
       }
-    } catch (e) { console.error('No pude refrescar:', e.message); }
+    } catch (e) { console.log('No pude refrescar:', e.message); }
   }
 
   return enviar(env, chatId, `✅ Fila ${fila} → "${nuevaDesc}"`);
@@ -1033,6 +1027,279 @@ async function handleVerAprendizaje(env, chatId) {
   return enviar(env, chatId, msg);
 }
 
+function limpiarHTML(html) {
+  return (html || '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\[https?:\/\/[^\]]+\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function handleTestCorreos(env, chatId) {
+  try {
+    const total = await contarCorreosBancolombia(env);
+    const lista = await listarCorreosBancolombia(env, 3);
+    let msg = `📧 <b>Test Gmail</b>\n\n`;
+    msg += `Correos con etiqueta "BancolombiaBot": <b>${total}</b>\n\n`;
+    if (lista.length > 0) {
+      msg += `<b>Últimos 3 asuntos:</b>\n`;
+      for (const m of lista) {
+        try {
+          const correo = await leerCorreo(env, m.id);
+          const asunto = (correo.asunto || '').slice(0, 60);
+          msg += `• ${asunto}\n`;
+        } catch (e) {
+          msg += `• (error leyendo ${m.id}: ${e.message})\n`;
+        }
+      }
+    }
+    return enviar(env, chatId, msg);
+  } catch (e) {
+    console.log('[TESTCORREOS] Error:', e.message);
+    return enviar(env, chatId, `❌ Error: ${e.message}`);
+  }
+}
+
+async function handleVerCorreo(env, chatId) {
+  try {
+    const correo = await verPrimerCorreo(env);
+    if (!correo) return enviar(env, chatId, '📭 No hay correos.');
+
+    let bodyLimpio = limpiarHTML(correo.body).slice(0, 1500);
+    bodyLimpio = bodyLimpio.replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+
+    const msg = `📧 Correo crudo\n\n` +
+      `De: ${correo.de || '(vacío)'}\n` +
+      `Asunto: ${correo.asunto || '(vacío)'}\n` +
+      `Fecha: ${correo.fecha || '(vacío)'}\n\n` +
+      `Body:\n\n` +
+      (bodyLimpio || '(body vacío)');
+
+    const resp = await tg(env, 'sendMessage', { chat_id: chatId, text: msg });
+    return resp;
+  } catch (e) {
+    console.log('[VERCORREO] Error:', e.message);
+    return enviar(env, chatId, `❌ Error: ${e.message}`);
+  }
+}
+
+async function handleTestParser(env, chatId) {
+  try {
+    await enviar(env, chatId, '🔍 Analizando correos...');
+
+    const lista = await listarCorreosBancolombia(env, 10);
+    let ok = 0;
+    let noReconocidos = 0;
+    let msg = `🔍 <b>Test parser</b>\n\n`;
+
+    for (const m of lista) {
+      try {
+        const correo = await leerCorreo(env, m.id);
+        const parsed = parsearCorreo(correo);
+        if (parsed) {
+          ok++;
+          msg += `✅ <b>${parsed.tipo.toUpperCase()}</b>: $${Math.round(parsed.monto).toLocaleString('es-CO')}\n`;
+          msg += `   ${parsed.descripcion}\n`;
+          msg += `   ${parsed.fecha} · ${parsed.medio}\n\n`;
+        } else {
+          noReconocidos++;
+          const bodyLimpio = limpiarHTML(correo.body).slice(0, 200);
+          msg += `❌ No reconocido:\n`;
+          msg += `${bodyLimpio}\n\n`;
+        }
+      } catch (e) {
+        console.log('[TESTPARSER] Error:', e.message);
+        msg += `⚠️ Error: ${e.message}\n\n`;
+      }
+    }
+
+    msg += `\n<b>Total:</b> ${ok} reconocidos, ${noReconocidos} no reconocidos`;
+
+    if (msg.length > 4000) {
+      await enviar(env, chatId, msg.slice(0, 4000));
+      return enviar(env, chatId, msg.slice(4000));
+    }
+    return enviar(env, chatId, msg);
+  } catch (e) {
+    console.log('[TESTPARSER] Error general:', e.message);
+    return enviar(env, chatId, `❌ Error: ${e.message}`);
+  }
+}
+
+// ============================================================
+// C.6 — HANDLERS DE CORREOS
+// ============================================================
+
+async function handleCorreos(env, chatId) {
+  try {
+    const idsExistentes = await leerIdsCorreosExistentes(env);
+    const listaGmail = await listarCorreosBancolombia(env, 30);
+
+    if (listaGmail.length === 0) {
+      if (chatId) await enviar(env, chatId, '📭 No hay correos etiquetados.');
+      return;
+    }
+
+    const nuevos = [];
+    for (const m of listaGmail) {
+      if (idsExistentes.has(String(m.id).trim())) continue;
+      try {
+        const correo = await leerCorreo(env, m.id);
+        const parsed = parsearCorreo(correo);
+        if (parsed) {
+          nuevos.push({ id: m.id, ...parsed });
+        }
+      } catch (e) {
+        console.log('[CORREOS] Error leyendo', m.id, e.message);
+      }
+    }
+
+    if (nuevos.length === 0) {
+      if (chatId) await enviar(env, chatId, '✅ No hay correos nuevos para registrar.');
+      return;
+    }
+
+    // Nómina se registra directo
+    const nominas = nuevos.filter(c => c.esNomina);
+    const pendientes = nuevos.filter(c => !c.esNomina);
+
+    for (const n of nominas) {
+      try {
+        const fila = await appendMovimiento(env, {
+          fecha: n.fecha || hoyColombia(),
+          rubro: 'Salario',
+          valor: n.monto,
+          descripcion: n.descripcion,
+          medio: n.medio || 'Transferencia',
+          tipo: 'Ingreso',
+          fuente: 'correo',
+          estado: 'confirmado',
+          id_correo: n.id,
+        });
+        await actualizarIdCorreo(env, fila, n.id);
+      } catch (e) {
+        console.log('[CORREOS] Error registrando nómina:', e.message);
+      }
+    }
+
+    // Gastos: crear borradores
+    const borradoresInfo = [];
+    for (const c of pendientes) {
+      try {
+        const { rubro } = await categorizarConAprendizaje(env, c.descripcion);
+        const fila = await appendMovimiento(env, {
+          fecha: c.fecha || hoyColombia(),
+          rubro,
+          valor: -Math.abs(c.monto),
+          descripcion: c.descripcion,
+          medio: c.medio || 'Debito',
+          tipo: 'Gasto',
+          fuente: 'correo',
+          estado: 'pendiente',
+          id_correo: c.id,
+        });
+        await actualizarIdCorreo(env, fila, c.id);
+        borradoresInfo.push({ fila, id: c.id, descripcion: c.descripcion, monto: c.monto, esIngreso: false });
+      } catch (e) {
+        console.log('[CORREOS] Error creando borrador:', e.message);
+      }
+    }
+
+    if (!chatId) return; // Cron silencioso si no hay chatId
+
+    // Mensaje resumen
+    let msg = `📧 <b>${borradoresInfo.length} correo(s) nuevo(s) para revisar</b>\n\n`;
+    if (nominas.length > 0) {
+      msg += `💼 Registré ${nominas.length} nómina(s) automáticamente.\n\n`;
+    }
+    for (const b of borradoresInfo) {
+      msg += `➖ $${fmt(b.monto)} — ${b.descripcion}\n`;
+    }
+
+    if (borradoresInfo.length > 0) {
+      msg += `\nConfirma con ✅ o revisa uno por uno.`;
+      await enviar(env, chatId, msg, {
+        reply_markup: tecladoCorreos(borradoresInfo),
+      });
+    } else if (nominas.length > 0) {
+      await enviar(env, chatId, msg);
+    }
+  } catch (e) {
+    console.log('[CORREOS] Error general:', e.message, e.stack);
+    if (chatId) await enviar(env, chatId, `❌ Error procesando correos: ${e.message}`);
+  }
+}
+
+async function handleCorreosConfirmarTodos(env, chatId) {
+  try {
+    const borradores = await listarBorradores(env);
+    if (borradores.length === 0) {
+      return enviar(env, chatId, '📭 No hay borradores pendientes.');
+    }
+    let count = 0;
+    for (const { fila } of borradores) {
+      await actualizarEstado(env, fila, 'confirmado');
+      try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
+      count++;
+    }
+    return enviar(env, chatId, `✅ Confirmados ${count} movimiento(s). Revisa /hoy.`);
+  } catch (e) {
+    console.log('[CORREOS_CONFIRMAR] Error:', e.message);
+    return enviar(env, chatId, `❌ Error: ${e.message}`);
+  }
+}
+
+async function handleCorreosIgnorarTodos(env, chatId) {
+  try {
+    const borradores = await listarBorradores(env);
+    let count = 0;
+    for (const { fila } of borradores) {
+      try {
+        await borrarFila(env, fila);
+        count++;
+      } catch (e) { /* noop */ }
+    }
+    return enviar(env, chatId, `❌ Ignorados ${count} correo(s).`);
+  } catch (e) {
+    console.log('[CORREOS_IGNORAR] Error:', e.message);
+    return enviar(env, chatId, `❌ Error: ${e.message}`);
+  }
+}
+
+async function handleCorreosVerIndividual(env, chatId) {
+  try {
+    const borradores = await listarBorradores(env);
+    if (borradores.length === 0) {
+      return enviar(env, chatId, '📭 No hay borradores pendientes.');
+    }
+    for (const { fila, data: r } of borradores) {
+      const valor = parsearValor(r[7]);
+      const msg =
+        `🕒 <b>Borrador</b> (fila ${fila})\n` +
+        textoBorrador(r[1], r[6], valor, r[8], r[9]) +
+        `\n\nPresiona ✅ para guardar:`;
+      const resp = await enviar(env, chatId, msg, {
+        reply_markup: tecladoCorreoIndividual(fila),
+      });
+      if (resp && resp.ok && resp.result) {
+        try { await guardarMsgId(env, fila, resp.result.message_id); } catch (e) { /* noop */ }
+      }
+    }
+    return;
+  } catch (e) {
+    console.log('[CORREOS_VER_UNO] Error:', e.message);
+    return enviar(env, chatId, `❌ Error: ${e.message}`);
+  }
+}
+
+// ---------- MANEJO DE MENSAJES Y CALLBACKS ----------
+
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
@@ -1056,6 +1323,7 @@ async function handleMensaje(env, msg) {
   if (texto.startsWith('/presupuesto')) return handlePresupuesto(env, chatId);
   if (texto.startsWith('/listar')) return handleListar(env, chatId, 0);
   if (texto.startsWith('/borradores')) return handleBorradores(env, chatId);
+  if (texto.startsWith('/correos')) return handleCorreos(env, chatId);
   if (texto.startsWith('/revisar')) {
     const m = texto.match(/^\/revisar\s+(\d+)/);
     const offset = m ? Number(m[1]) : 0;
@@ -1063,6 +1331,9 @@ async function handleMensaje(env, msg) {
   }
   if (texto.startsWith('/aprender')) return handleAprender(env, chatId);
   if (texto.startsWith('/aprendizaje')) return handleVerAprendizaje(env, chatId);
+  if (texto.startsWith('/testcorreos')) return handleTestCorreos(env, chatId);
+  if (texto.startsWith('/vercorreo')) return handleVerCorreo(env, chatId);
+  if (texto.startsWith('/testparser')) return handleTestParser(env, chatId);
 
   if (texto.startsWith('/editar')) {
     const m = texto.match(/^\/editar\s+(\d+)/);
@@ -1272,6 +1543,33 @@ async function handleCallback(env, cq) {
     }
     return msgResp;
   }
+
+  // ---------- C.6 CALLBACKS DE CORREOS ----------
+
+  if (accion === 'correos_confirmar_todos') {
+    return handleCorreosConfirmarTodos(env, chatId);
+  }
+
+  if (accion === 'correos_ignorar_todos') {
+    return handleCorreosIgnorarTodos(env, chatId);
+  }
+
+  if (accion === 'correos_ver_individual') {
+    return handleCorreosVerIndividual(env, chatId);
+  }
+
+  if (accion === 'correo_ver') {
+    const fila = Number(params[0]);
+    const r = await leerMovimientoPorFila(env, fila);
+    if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré la fila ${fila}.`);
+    const valor = parsearValor(r[7]);
+    return editarMensaje(env, chatId, messageId,
+      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      textoBorrador(r[1], r[6], valor, r[8], r[9]) +
+      `\n\nPresiona ✅ para guardar:`,
+      { reply_markup: tecladoCorreoIndividual(fila) }
+    );
+  }
 }
 
 export default {
@@ -1287,7 +1585,7 @@ export default {
             await handleCallback(env, update.callback_query);
           }
         } catch (e) {
-          console.error('ERROR EN WEBHOOK:', e.message, e.stack);
+          console.log('ERROR EN WEBHOOK:', e.message, e.stack);
         }
       })());
       return new Response('ok');
@@ -1319,9 +1617,12 @@ export default {
         for (const msgId of resultado.msgs) {
           try { await borrarMensaje(env, chatId, msgId); } catch (e) { /* noop */ }
         }
+      } else if (event.cron === '*/15 * * * *') {
+        const chatId = env.TELEGRAM_CHAT_ID;
+        await handleCorreos(env, chatId);
       }
     } catch (e) {
-      console.error('Error en cron:', e.message, e.stack);
+      console.log('Error en cron:', e.message, e.stack);
     }
   },
 };
