@@ -42,6 +42,7 @@ export function tecladoBorrador(fila) {
     inline_keyboard: [
       [{ text: '✅ Guardar', callback_data: `ok:${fila}` }],
       [
+        { text: '💲 Valor', callback_data: `valor:${fila}` },
         { text: '💳 Medio', callback_data: `medio:${fila}` },
         { text: '✏️ Rubro', callback_data: `rubro:${fila}` },
       ],
@@ -56,14 +57,22 @@ export function tecladoBorradorEdicion(fila) {
     inline_keyboard: [
       [{ text: '✅ Guardar cambios', callback_data: `ok:${fila}` }],
       [
+        { text: '💲 Valor', callback_data: `valor:${fila}` },
         { text: '💳 Medio', callback_data: `medio:${fila}` },
         { text: '✏️ Rubro', callback_data: `rubro:${fila}` },
       ],
-      [
-        { text: '↩️ Volver sin cambios', callback_data: `volver_edicion:${fila}` },
-        { text: '🗑️ Eliminar', callback_data: `eliminar:${fila}` },
-      ],
+      [{ text: '↩️ Volver sin cambios', callback_data: `volver_edicion:${fila}` }],
+      [{ text: '🗑️ Eliminar definitivamente', callback_data: `confirmar_eliminar:${fila}` }],
     ],
+  };
+}
+
+export function tecladoConfirmarEliminar(fila) {
+  return {
+    inline_keyboard: [[
+      { text: '🗑️ Sí, eliminar', callback_data: `eliminar:${fila}` },
+      { text: '↩️ No, volver', callback_data: `volver_edicion:${fila}` },
+    ]],
   };
 }
 
@@ -120,4 +129,13 @@ export function tecladoListado(offset, total) {
   if (offset + 10 < total) nav.push({ text: '➡️ Siguientes', callback_data: `listar:${offset + 10}` });
   if (nav.length > 0) filas.push(nav);
   return { inline_keyboard: filas };
+}
+
+export function tecladoConfirmarValorAlto(fila) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Sí, es correcto', callback_data: `valor_ok:${fila}` },
+      { text: '↩️ No, cancelar', callback_data: `volver:${fila}` },
+    ]],
+  };
 }

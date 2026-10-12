@@ -11,6 +11,8 @@ import {
   tecladoDuplicado,
   tecladoBorrarConfirmar,
   tecladoListado,
+  tecladoConfirmarEliminar,
+  tecladoConfirmarValorAlto,
 } from './telegram.js';
 import {
   appendMovimiento,
@@ -21,7 +23,8 @@ import {
   actualizarEstado,
   actualizarValor,
   actualizarDescripcion,
-  actualizarFecha,
+  guardarMsgId,
+  limpiarMsgId,
   borrarFila,
   leerPresupuestoMes,
   parsearValor,
@@ -29,6 +32,9 @@ import {
   limpiarBorradoresViejos,
   listarMovimientos,
 } from './sheets.js';
+
+const TOPE_VALOR = 1000000;       // Tope duro
+const UMBRAL_CONFIRMAR = 500000;  // Pide confirmación si supera esto
 
 const RUBROS_KEYWORDS = {
   'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada'],
@@ -166,7 +172,7 @@ async function buscarDuplicado(env, descripcion, monto) {
   return null;
 }
 
-function textoBorrador(fila, fecha, rubro, valor, desc, medio) {
+function textoBorrador(fecha, rubro, valor, desc, medio) {
   const fechaFmt = normalizarFecha(fecha);
   return (
     `<b>$${fmt(Math.abs(valor))}</b> — ${desc}\n` +
@@ -202,6 +208,13 @@ async function handleStart(env, chatId) {
 }
 
 async function handleRegistrar(env, chatId, monto, desc, medio) {
+  if (monto > TOPE_VALOR) {
+    return enviar(env, chatId,
+      `❌ El monto supera el tope de <b>$${fmt(TOPE_VALOR)}</b>.\n` +
+      `Si de verdad es tan alto, edítalo a mano en la hoja.`
+    );
+  }
+
   const rubro = categorizar(desc);
   const fecha = hoyColombia();
 
@@ -228,12 +241,19 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     estado: 'pendiente',
   });
 
-  return enviar(env, chatId,
+  const msgResp = await enviar(env, chatId,
     `🕒 <b>Borrador</b> (fila ${fila})\n` +
-    textoBorrador(fila, fecha, rubro, -monto, desc, medioFinal) +
+    textoBorrador(fecha, rubro, -monto, desc, medioFinal) +
     `\n\nPresiona ✅ para guardar:`,
     { reply_markup: tecladoBorrador(fila) }
   );
+
+  // Guardamos el message_id del borrador en la columna P
+  if (msgResp && msgResp.ok && msgResp.result) {
+    try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
+  }
+
+  return msgResp;
 }
 
 async function handleSaldo(env, chatId) {
@@ -419,11 +439,17 @@ async function handleEditar(env, chatId, fila) {
 
   await actualizarEstado(env, fila, 'pendiente');
 
-  return enviar(env, chatId,
+  const msgResp = await enviar(env, chatId,
     `✏️ <b>Editando fila ${fila}</b>\n\n` +
-    textoBorrador(fila, r[1], r[6], parsearValor(r[7]), r[8], r[9]),
+    textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], r[9]),
     { reply_markup: tecladoBorradorEdicion(fila) }
   );
+
+  if (msgResp && msgResp.ok && msgResp.result) {
+    try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
+  }
+
+  return msgResp;
 }
 
 async function handleBorrar(env, chatId, fila) {
@@ -445,24 +471,85 @@ async function handleBorrar(env, chatId, fila) {
 
 async function handleValor(env, chatId, texto) {
   const m = texto.match(/^(\d+)\s+([\d.,]+)$/);
-  if (!m) return enviar(env, chatId, '❌ Formato: /valor 571 5000');
+  if (!m) {
+    return enviar(env, chatId,
+      `❌ Formato incorrecto.\n\n` +
+      `Uso: <code>/valor N MONTO</code>\n` +
+      `Ejemplo: <code>/valor 574 5000</code>\n\n` +
+      `El monto solo puede tener números.`
+    );
+  }
   const fila = Number(m[1]);
   const nuevoValor = Number(m[2].replace(/[.,]/g, ''));
+
+  if (nuevoValor <= 0) {
+    return enviar(env, chatId, '❌ El monto debe ser mayor a 0.');
+  }
+  if (nuevoValor > TOPE_VALOR) {
+    return enviar(env, chatId,
+      `❌ El monto supera el tope de <b>$${fmt(TOPE_VALOR)}</b>.\n` +
+      `Si de verdad es tan alto, edítalo a mano en la hoja.`
+    );
+  }
+
   const r = await leerMovimientoPorFila(env, fila);
   if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
+
+  if (nuevoValor > UMBRAL_CONFIRMAR) {
+    // Pide confirmación
+    return enviar(env, chatId,
+      `⚠️ El nuevo valor es <b>$${fmt(nuevoValor)}</b>, mayor a $${fmt(UMBRAL_CONFIRMAR)}.\n` +
+      `¿Estás seguro?`,
+      { reply_markup: tecladoConfirmarValorAlto(fila) }
+    );
+  }
+
   const signo = r[10] === 'Gasto' ? -1 : 1;
   await actualizarValor(env, fila, signo * nuevoValor);
-  return enviar(env, chatId, `✅ Fila ${fila} → valor $${fmt(nuevoValor)}`);
+
+  // Refresca el mensaje del borrador si existe
+  await refrescarBorrador(env, chatId, fila, r);
+
+  return enviar(env, chatId, `✅ Fila ${fila} → valor <b>$${fmt(nuevoValor)}</b>`);
+}
+
+// Refresca el mensaje del borrador (si tiene msg_id guardado)
+async function refrescarBorrador(env, chatId, fila, rOriginal) {
+  const msgId = rOriginal?.[15];
+  if (!msgId) return;
+  try {
+    const rNuevo = await leerMovimientoPorFila(env, fila);
+    if (!rNuevo) return;
+    if (rNuevo[12] !== 'pendiente') return;
+    const teclado = rNuevo[10] === 'Gasto' && rNuevo[12] === 'pendiente'
+      ? tecladoBorrador(fila)
+      : tecladoBorrador(fila);
+    await editarMensaje(env, chatId, Number(msgId),
+      `🕒 <b>Borrador</b> (fila ${fila})\n` +
+      textoBorrador(rNuevo[1], rNuevo[6], parsearValor(rNuevo[7]), rNuevo[8], rNuevo[9]) +
+      `\n\nPresiona ✅ para guardar:`,
+      { reply_markup: teclado }
+    );
+  } catch (e) {
+    console.error('No pude refrescar borrador:', e.message);
+  }
 }
 
 async function handleDesc(env, chatId, texto) {
   const m = texto.match(/^(\d+)\s+(.+)$/);
-  if (!m) return enviar(env, chatId, '❌ Formato: /desc 571 almuerzo con Juan');
+  if (!m) {
+    return enviar(env, chatId,
+      `❌ Formato incorrecto.\n\n` +
+      `Uso: <code>/desc N TEXTO</code>\n` +
+      `Ejemplo: <code>/desc 574 almuerzo con Juan</code>`
+    );
+  }
   const fila = Number(m[1]);
   const nuevaDesc = m[2];
   const r = await leerMovimientoPorFila(env, fila);
   if (!r) return enviar(env, chatId, `❌ No encontré la fila ${fila}.`);
   await actualizarDescripcion(env, fila, nuevaDesc);
+  await refrescarBorrador(env, chatId, fila, r);
   return enviar(env, chatId, `✅ Fila ${fila} → "${nuevaDesc}"`);
 }
 
@@ -484,13 +571,27 @@ async function handleMensaje(env, msg) {
 
   if (texto.startsWith('/editar')) {
     const m = texto.match(/^\/editar\s+(\d+)/);
-    if (!m) return enviar(env, chatId, '❌ Formato: /editar 571');
+    if (!m) {
+      return enviar(env, chatId,
+        `❌ Falta el número de fila.\n\n` +
+        `Uso: <code>/editar N</code>\n` +
+        `Ejemplo: <code>/editar 574</code>\n\n` +
+        `Usa /listar para ver los números de fila.`
+      );
+    }
     return handleEditar(env, chatId, Number(m[1]));
   }
 
   if (texto.startsWith('/borrar')) {
     const m = texto.match(/^\/borrar\s+(\d+)/);
-    if (!m) return enviar(env, chatId, '❌ Formato: /borrar 571');
+    if (!m) {
+      return enviar(env, chatId,
+        `❌ Falta el número de fila.\n\n` +
+        `Uso: <code>/borrar N</code>\n` +
+        `Ejemplo: <code>/borrar 574</code>\n\n` +
+        `Usa /listar para ver los números de fila.`
+      );
+    }
     return handleBorrar(env, chatId, Number(m[1]));
   }
 
@@ -534,6 +635,7 @@ async function handleCallback(env, cq) {
   if (accion === 'ok') {
     const fila = Number(params[0]);
     await actualizarEstado(env, fila, 'confirmado');
+    await limpiarMsgId(env, fila);
     const r = await leerMovimientoPorFila(env, fila);
     const valor = parsearValor(r?.[7]);
     const desc = r?.[8] || '';
@@ -555,7 +657,7 @@ async function handleCallback(env, cq) {
     return enviar(env, chatId, `🗑️ Cancelado (fila ${fila} eliminada)`);
   }
 
-  // --- ELIMINAR (desde teclado de edición) ---
+  // --- ELIMINAR (desde confirmación) ---
   if (accion === 'eliminar') {
     const fila = Number(params[0]);
     await borrarFila(env, fila);
@@ -563,10 +665,25 @@ async function handleCallback(env, cq) {
     return enviar(env, chatId, `🗑️ Fila ${fila} eliminada`);
   }
 
+  // --- CONFIRMAR ELIMINAR (pide confirmación) ---
+  if (accion === 'confirmar_eliminar') {
+    const fila = Number(params[0]);
+    const r = await leerMovimientoPorFila(env, fila);
+    if (!r) return editarMensaje(env, chatId, messageId, `❌ No encontré la fila ${fila}.`);
+    return editarMensaje(env, chatId, messageId,
+      `⚠️ <b>¿Seguro que quieres eliminar la fila ${fila}?</b>\n\n` +
+      `<b>$${fmt(Math.abs(parsearValor(r[7])))}</b> — ${r[8] || ''}\n` +
+      `Rubro: <i>${r[6]}</i>\n\n` +
+      `Esto no se puede deshacer.`,
+      { reply_markup: tecladoConfirmarEliminar(fila) }
+    );
+  }
+
   // --- VOLVER SIN CAMBIOS (edición) ---
   if (accion === 'volver_edicion') {
     const fila = Number(params[0]);
     await actualizarEstado(env, fila, 'confirmado');
+    await limpiarMsgId(env, fila);
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
     return enviar(env, chatId, `↩️ Fila ${fila} sin cambios`);
   }
@@ -587,6 +704,18 @@ async function handleCallback(env, cq) {
     });
   }
 
+  // --- BOTÓN VALOR (solo guía) ---
+  if (accion === 'valor') {
+    const fila = Number(params[0]);
+    return editarMensaje(env, chatId, messageId,
+      `💲 <b>Cambiar valor de la fila ${fila}</b>\n\n` +
+      `Escribe el comando así:\n` +
+      `<code>/valor ${fila} 5000</code>\n\n` +
+      `Toca ↩️ Volver para regresar al borrador.`,
+      { reply_markup: { inline_keyboard: [[{ text: '↩️ Volver', callback_data: `volver:${fila}` }]] } }
+    );
+  }
+
   // --- VOLVER AL BORRADOR ---
   if (accion === 'volver') {
     const fila = Number(params[0]);
@@ -594,7 +723,7 @@ async function handleCallback(env, cq) {
     if (!r) return;
     return editarMensaje(env, chatId, messageId,
       `🕒 <b>Borrador</b> (fila ${fila})\n` +
-      textoBorrador(fila, r[1], r[6], parsearValor(r[7]), r[8], r[9]) +
+      textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], r[9]) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
     );
@@ -608,7 +737,7 @@ async function handleCallback(env, cq) {
     const r = await leerMovimientoPorFila(env, fila);
     return editarMensaje(env, chatId, messageId,
       `🕒 <b>Borrador</b> (fila ${fila})\n` +
-      textoBorrador(fila, r[1], nuevoRubro, parsearValor(r[7]), r[8], r[9]) +
+      textoBorrador(r[1], nuevoRubro, parsearValor(r[7]), r[8], r[9]) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
     );
@@ -622,10 +751,22 @@ async function handleCallback(env, cq) {
     const r = await leerMovimientoPorFila(env, fila);
     return editarMensaje(env, chatId, messageId,
       `🕒 <b>Borrador</b> (fila ${fila})\n` +
-      textoBorrador(fila, r[1], r[6], parsearValor(r[7]), r[8], nuevoMedio) +
+      textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], nuevoMedio) +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
     );
+  }
+
+  // --- CONFIRMAR VALOR ALTO ---
+  if (accion === 'valor_ok') {
+    const fila = Number(params[0]);
+    const r = await leerMovimientoPorFila(env, fila);
+    if (!r) return;
+    const valor = parsearValor(r[7]);
+    const signo = r[10] === 'Gasto' ? -1 : 1;
+    await actualizarValor(env, fila, signo * Math.abs(valor));
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
+    return enviar(env, chatId, `✅ Fila ${fila} → valor <b>$${fmt(Math.abs(valor))}</b>`);
   }
 
   // --- LISTAR PAGINACIÓN ---
@@ -634,7 +775,7 @@ async function handleCallback(env, cq) {
     return handleListar(env, chatId, offset);
   }
 
-  // --- CONFIRMAR BORRAR ---
+  // --- CONFIRMAR BORRAR (desde /borrar) ---
   if (accion === 'confirmar_borrar') {
     const fila = Number(params[0]);
     await borrarFila(env, fila);
@@ -642,7 +783,6 @@ async function handleCallback(env, cq) {
     return enviar(env, chatId, `🗑️ Fila ${fila} eliminada`);
   }
 
-  // --- CANCELAR BORRAR ---
   if (accion === 'cancelar_borrar') {
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* ya borrado */ }
     return enviar(env, chatId, `↩️ Borrado cancelado`);
@@ -670,12 +810,16 @@ async function handleCallback(env, cq) {
       fuente: 'manual',
       estado: 'pendiente',
     });
-    return editarMensaje(env, chatId, messageId,
+    const msgResp = await editarMensaje(env, chatId, messageId,
       `🕒 <b>Borrador</b> (fila ${fila})\n` +
-      textoBorrador(fila, fecha, rubro, -monto, desc, 'Efectivo') +
+      textoBorrador(fecha, rubro, -monto, desc, 'Efectivo') +
       `\n\nPresiona ✅ para guardar:`,
       { reply_markup: tecladoBorrador(fila) }
     );
+    if (msgResp && msgResp.ok) {
+      try { await guardarMsgId(env, fila, messageId); } catch (e) { /* noop */ }
+    }
+    return msgResp;
   }
 }
 

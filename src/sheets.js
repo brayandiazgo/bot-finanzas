@@ -126,9 +126,10 @@ export async function appendMovimiento(env, mov) {
     mov.estado || 'pendiente',
     mov.id_correo || '',
     mov.nota || '',
+    '', // P: msg_id (se llena después)
   ]];
 
-  await sheetsRequest(env, `/values/MOVIMIENTOS!A${fila}:O${fila}?valueInputOption=USER_ENTERED`, {
+  await sheetsRequest(env, `/values/MOVIMIENTOS!A${fila}:P${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
     body: JSON.stringify({ values: valores }),
   });
@@ -171,10 +172,18 @@ export async function actualizarDescripcion(env, fila, desc) {
   });
 }
 
-export async function actualizarFecha(env, fila, fecha) {
-  return sheetsRequest(env, `/values/MOVIMIENTOS!B${fila}?valueInputOption=USER_ENTERED`, {
+// Guarda el message_id del borrador en la columna P
+export async function guardarMsgId(env, fila, msgId) {
+  return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
-    body: JSON.stringify({ values: [[fecha]] }),
+    body: JSON.stringify({ values: [[msgId]] }),
+  });
+}
+
+export async function limpiarMsgId(env, fila) {
+  return sheetsRequest(env, `/values/MOVIMIENTOS!P${fila}`, {
+    method: 'PUT',
+    body: JSON.stringify({ values: [['']] }),
   });
 }
 
@@ -201,7 +210,6 @@ export async function borrarFila(env, fila) {
   });
 }
 
-// Normaliza fechas a YYYY-MM-DD
 export function normalizarFecha(v) {
   if (!v) return '';
   const s = String(v);
@@ -218,7 +226,7 @@ export function normalizarFecha(v) {
 export async function leerMovimientos(env, desde, hasta, soloConfirmados = false) {
   const data = await sheetsRequest(
     env,
-    `/values/MOVIMIENTOS!A:O?valueRenderOption=FORMATTED_VALUE`
+    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
   );
   const rows = data.values || [];
   const resultado = [];
@@ -237,7 +245,7 @@ export async function leerMovimientos(env, desde, hasta, soloConfirmados = false
 export async function leerMovimientoPorFila(env, fila) {
   const data = await sheetsRequest(
     env,
-    `/values/MOVIMIENTOS!A${fila}:O${fila}?valueRenderOption=FORMATTED_VALUE`
+    `/values/MOVIMIENTOS!A${fila}:P${fila}?valueRenderOption=FORMATTED_VALUE`
   );
   return data.values?.[0] || null;
 }
@@ -274,11 +282,10 @@ export async function leerConfig(env) {
   return data.values || [];
 }
 
-// Lista los últimos movimientos (con paginación)
 export async function listarMovimientos(env, limite, offset, incluirPendientes = false) {
   const data = await sheetsRequest(
     env,
-    `/values/MOVIMIENTOS!A:O?valueRenderOption=FORMATTED_VALUE`
+    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
   );
   const rows = data.values || [];
   const validos = [];
@@ -295,11 +302,10 @@ export async function listarMovimientos(env, limite, offset, incluirPendientes =
   };
 }
 
-// Borra todas las filas con estado "pendiente"
 export async function limpiarBorradoresViejos(env) {
   const data = await sheetsRequest(
     env,
-    `/values/MOVIMIENTOS!A:O?valueRenderOption=FORMATTED_VALUE`
+    `/values/MOVIMIENTOS!A:P?valueRenderOption=FORMATTED_VALUE`
   );
   const rows = data.values || [];
   const filasABorrar = [];
