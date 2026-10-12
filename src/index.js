@@ -264,7 +264,6 @@ async function verificarAlertas(env, chatId, rubroTocado = null) {
           const key = `${mesKey}:${p.rubro}:${umbral}`;
           if (!alertasEnviadas.has(key)) {
             // Solo mandar mensaje si es el rubro que se acaba de tocar
-            // o si es un rubro nuevo (no existía en el barrido inicial)
             if (esRubroTocado) {
               const icono = umbral === 100 ? '🚨' : '⚠️';
               const nivel = umbral === 100 ? '<b>EXCEDIDO</b>' : 'cerca del límite';
@@ -277,7 +276,7 @@ async function verificarAlertas(env, chatId, rubroTocado = null) {
                   : `Disponible: $${fmt(p.monto - gastado)}`)
               );
             }
-            // En cualquier caso, marcar como enviada para no repetir
+            // En cualquier caso, marcar como enviada
             await guardarAlerta(env, mesKey, p.rubro, umbral);
           }
         }
@@ -287,7 +286,6 @@ async function verificarAlertas(env, chatId, rubroTocado = null) {
     console.log('[ALERTAS] Error:', e.message);
   }
 }
-
 // ---------- C.5: ANÁLISIS MENSUAL ----------
 
 async function calcularSugerenciaMensual(env) {
@@ -900,18 +898,75 @@ async function handlePresupuesto(env, chatId) {
   const hoy = hoyColombia();
   const año = Number(hoy.slice(0, 4));
   const mesNum = Number(hoy.slice(5, 7));
+  const mesIni = hoy.slice(0, 7) + '-01';
+  const diaHoy = Number(hoy.slice(8, 10));
+  const ultimoDia = new Date(año, mesNum, 0).getDate();
+  const diasRestantes = ultimoDia - diaHoy + 1;
+
   const presupuesto = await leerPresupuestoMes(env, año, mesNum);
-  if (presupuesto.length === 0) return enviar(env, chatId, '📭 No hay presupuesto cargado para este mes.');
-  let msg = `🎯 <b>Presupuesto del mes</b>\n\n`;
-  let total = 0;
-  for (const p of presupuesto) {
-    if (p.monto > 0) {
-      msg += `• ${p.rubro}: $${fmt(p.monto)}\n`;
-      total += p.monto;
-    }
+  if (presupuesto.length === 0) {
+    return enviar(env, chatId, '📭 No hay presupuesto cargado para este mes.');
   }
-  msg += `\n<b>Total: $${fmt(total)}</b>`;
+
+  const rows = await leerMovimientos(env, mesIni, hoy, true);
+  const porRubro = {};
+  for (const { data: r } of rows) {
+    if (r[10] !== 'Gasto') continue;
+    const rubro = r[6] || 'Otro';
+    porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(parsearValor(r[7]));
+  }
+
+  const rubrosConDatos = [];
+  let totalPres = 0;
+  let totalGastado = 0;
+
+  for (const p of presupuesto) {
+    if (p.monto <= 0) continue;
+    const gastado = porRubro[p.rubro] || 0;
+    const disponible = p.monto - gastado;
+    const pct = (gastado / p.monto) * 100;
+    rubrosConDatos.push({ rubro: p.rubro, monto: p.monto, gastado, disponible, pct });
+    totalPres += p.monto;
+    totalGastado += gastado;
+  }
+
+  // Ordenar por % descendente (los más críticos primero)
+  rubrosConDatos.sort((a, b) => b.pct - a.pct);
+
+  const mesNombre = MESES[mesNum - 1].charAt(0).toUpperCase() + MESES[mesNum - 1].slice(1);
+  let msg = `🎯 <b>Presupuesto ${mesNombre} ${año}</b>\n`;
+  msg += `📅 Quedan <b>${diasRestantes}</b> días\n\n`;
+
+  // Barra general
+  const pctTotal = totalPres > 0 ? (totalGastado / totalPres) * 100 : 0;
+  const barraTotal = barraProgreso(pctTotal);
+  const iconoTotal = pctTotal > 100 ? '🔴' : pctTotal >= 80 ? '🟡' : '🟢';
+
+  msg += `${iconoTotal} <b>Total</b>: $${fmt(totalGastado)} / $${fmt(totalPres)} (${pctTotal.toFixed(0)}%)\n`;
+  msg += `<code>${barraTotal}</code>\n`;
+  if (totalGastado > totalPres) {
+    msg += `⚠️ Excedido en $${fmt(totalGastado - totalPres)}\n`;
+  } else {
+    msg += `💰 Disponible: $${fmt(totalPres - totalGastado)}\n`;
+  }
+  msg += `\n<b>Por rubro:</b>\n`;
+
+  for (const r of rubrosConDatos) {
+    const icono = r.pct > 100 ? '🔴' : r.pct >= 80 ? '🟡' : r.pct >= 50 ? '🟠' : '🟢';
+    const pctStr = r.pct.toFixed(0).padStart(3);
+    msg += `${icono} <b>${r.rubro}</b>: $${fmt(r.gastado)} / $${fmt(r.monto)} (${pctStr}%)\n`;
+  }
+
   return enviar(env, chatId, msg);
+}
+
+// Genera una barra de progreso tipo ████████░░░░░░░░
+function barraProgreso(pct) {
+  const total = 16;
+  const pctCap = Math.min(pct, 100);
+  const llenos = Math.round((pctCap / 100) * total);
+  const vacios = total - llenos;
+  return '█'.repeat(llenos) + '░'.repeat(vacios);
 }
 
 async function handleListar(env, chatId, offset = 0, messageId = null) {
@@ -1615,22 +1670,23 @@ async function handleCallback(env, cq) {
   const data = cq.data || '';
   const [accion, ...params] = data.split(':');
 
-  if (accion === 'ok') {
-  const fila = Number(params[0]);
-  await actualizarEstado(env, fila, 'confirmado');
-  try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
-  const r = await leerMovimientoPorFila(env, fila);
-  const valor = parsearValor(r?.[7]);
-  const desc = r?.[8] || '';
-  const rubro = r?.[6] || '';
-  const medio = r?.[9] || '';
-  const id = String(r?.[0] || fila).trim();
-  try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-  await verificarAlertas(env, chatId, rubro);
-  return enviar(env, chatId,
-    `✅ <b>Guardado</b> (ID ${id})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
-  );
-}
+    if (accion === 'ok') {
+    const fila = Number(params[0]);
+    await actualizarEstado(env, fila, 'confirmado');
+    try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
+    const r = await leerMovimientoPorFila(env, fila);
+    const valor = parsearValor(r?.[7]);
+    const desc = r?.[8] || '';
+    const rubro = r?.[6] || '';
+    const medio = r?.[9] || '';
+    const id = String(r?.[0] || fila).trim();
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    // Verificar alertas solo del rubro que se acaba de tocar
+    await verificarAlertas(env, chatId, rubro);
+    return enviar(env, chatId,
+      `✅ <b>Guardado</b> (ID ${id})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
+    );
+  }
 
   if (accion === 'cancelar') {
     const fila = Number(params[0]);
