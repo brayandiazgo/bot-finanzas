@@ -128,6 +128,7 @@ export function tecladoListado(offset, total) {
   if (offset > 0) nav.push({ text: '⬅️ Anteriores', callback_data: `listar:${Math.max(0, offset - 10)}` });
   if (offset + 10 < total) nav.push({ text: '➡️ Siguientes', callback_data: `listar:${offset + 10}` });
   if (nav.length > 0) filas.push(nav);
+  filas.push([{ text: '✖️ Cerrar', callback_data: 'listar_cerrar' }]);
   return { inline_keyboard: filas };
 }
 

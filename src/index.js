@@ -908,9 +908,10 @@ async function handlePresupuesto(env, chatId) {
   return enviar(env, chatId, msg);
 }
 
-async function handleListar(env, chatId, offset = 0) {
+async function handleListar(env, chatId, offset = 0, messageId = null) {
   const { total, items } = await listarMovimientos(env, 10, offset, false);
   if (total === 0) return enviar(env, chatId, '📭 No hay movimientos confirmados.');
+
   let msg = `📋 <b>Movimientos recientes</b> (${offset + 1}-${Math.min(offset + 10, total)} de ${total})\n\n`;
   for (const { data: r } of items) {
     const valor = parsearValor(r[7]);
@@ -921,9 +922,14 @@ async function handleListar(env, chatId, offset = 0) {
     msg += `<b>#${id}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
   }
   msg += `\nUsa /editar ID o /borrar ID para modificar un movimiento.`;
-  return enviar(env, chatId, msg, { reply_markup: tecladoListado(offset, total) });
-}
 
+  const teclado = tecladoListado(offset, total);
+
+  if (messageId) {
+    return editarMensaje(env, chatId, messageId, msg, { reply_markup: teclado });
+  }
+  return enviar(env, chatId, msg, { reply_markup: teclado });
+}
 async function handleBorradores(env, chatId) {
   const borradores = await listarBorradores(env);
   if (borradores.length === 0) return enviar(env, chatId, '📭 No hay borradores pendientes.');
@@ -1719,10 +1725,15 @@ async function handleCallback(env, cq) {
     );
   }
 
-  if (accion === 'listar') {
-    const offset = Number(params[0]) || 0;
-    return handleListar(env, chatId, offset);
-  }
+if (accion === 'listar') {
+  const offset = Number(params[0]) || 0;
+  return handleListar(env, chatId, offset, messageId);
+}
+
+if (accion === 'listar_cerrar') {
+  try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+  return;
+}
 
   if (accion === 'confirmar_borrar') {
     const fila = Number(params[0]);
