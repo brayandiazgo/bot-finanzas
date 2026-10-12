@@ -210,17 +210,11 @@ async function buscarDuplicado(env, descripcion, monto) {
 function textoBorrador(fecha, rubro, valor, desc, medio) {
   const fechaFmt = normalizarFecha(fecha);
   return (
-    `<b>$${fmt(Math.abs(valor))}</b> — ${escaparHTML(desc)}\n` +
+    `<b>$${fmt(Math.abs(valor))}</b> — ${desc}\n` +
     `Fecha: <i>${fechaFmt}</i>\n` +
-    `Rubro: <i>${escaparHTML(rubro)}</i>\n` +
-    `Medio: <i>${escaparHTML(medio)}</i>`
+    `Rubro: <i>${rubro}</i>\n` +
+    `Medio: <i>${medio}</i>`
   );
-function escaparHTML(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
 }
 
 async function borrarMensajesDeBorradoresViejos(env, chatId) {
@@ -1089,7 +1083,11 @@ async function handleVerCorreo(env, chatId) {
       `Body:\n\n` +
       (bodyLimpio || '(body vacío)');
 
-    const resp = await tg(env, 'sendMessage', { chat_id: chatId, text: msg });
+    const resp = await tg(env, 'sendMessage', {
+      chat_id: chatId,
+      text: msg,
+      disable_web_page_preview: true,
+    });
     return resp;
   } catch (e) {
     console.log('[VERCORREO] Error:', e.message);
@@ -1145,12 +1143,8 @@ async function handleTestParser(env, chatId) {
 // ============================================================
 
 async function handleCorreos(env, chatId) {
-  const DIAS_MAX_ANTIGUEDAD = 5;   // Ignorar correos con más de N días
-  const MAX_POR_CORRIDA = 8;       // Máximo de correos a procesar por invocación
-
-for (const b of borradoresInfo) {
-  msg += `➖ $${fmt(b.monto)} — ${escaparHTML(b.descripcion)}\n`;
-}
+  const DIAS_MAX_ANTIGUEDAD = 5;
+  const MAX_POR_CORRIDA = 8;
 
   try {
     const idsExistentes = await leerIdsCorreosExistentes(env);
@@ -1161,17 +1155,15 @@ for (const b of borradoresInfo) {
       return;
     }
 
-    // Fecha límite: correos más viejos se ignoran
     const limiteMs = Date.now() - DIAS_MAX_ANTIGUEDAD * 24 * 60 * 60 * 1000;
 
-    // 1) Leer correos (esto sí consume subrequests: 1 por correo)
+    // 1) Leer correos
     const candidatos = [];
     let ignoradosPorViejos = 0;
     for (const m of listaGmail) {
       if (idsExistentes.has(String(m.id).trim())) continue;
       try {
         const correo = await leerCorreo(env, m.id);
-        // Filtro por fecha del header
         if (correo.fecha) {
           const fechaMs = Date.parse(correo.fecha);
           if (!isNaN(fechaMs) && fechaMs < limiteMs) {
@@ -1184,20 +1176,22 @@ for (const b of borradoresInfo) {
       } catch (e) {
         console.log('[CORREOS] Error leyendo', m.id, e.message);
       }
-      // Cortamos el bucle si ya tenemos suficientes
       if (candidatos.length >= MAX_POR_CORRIDA) break;
     }
 
+    // 2) Sin candidatos → avisar y salir
     if (candidatos.length === 0) {
-      let msg = '✅ No hay correos nuevos para registrar.';
-      if (ignoradosPorViejos > 0) {
-        msg += `\n(${ignoradosPorViejos} correo(s) viejo(s) ignorado(s) — más de ${DIAS_MAX_ANTIGUEDAD} días)`;
+      if (chatId) {
+        let msgVacio = '✅ No hay correos nuevos para registrar.';
+        if (ignoradosPorViejos > 0) {
+          msgVacio += `\n(${ignoradosPorViejos} correo(s) viejo(s) ignorado(s) — más de ${DIAS_MAX_ANTIGUEDAD} días)`;
+        }
+        await enviar(env, chatId, msgVacio);
       }
-      if (chatId) await enviar(env, chatId, msg);
       return;
     }
 
-    // 2) Cargar aprendizaje UNA sola vez
+    // 3) Cargar aprendizaje UNA vez
     const aprend = await leerAprendizaje(env);
 
     function categorizarConCache(desc) {
@@ -1212,13 +1206,11 @@ for (const b of borradoresInfo) {
       return { rubro: 'Otro', fuente: 'ninguna' };
     }
 
-    // 3) Armar el batch de movimientos
+    // 4) Armar batch
     const nominas = candidatos.filter(c => c.esNomina);
     const pendientes = candidatos.filter(c => !c.esNomina);
-
     const movsBatch = [];
 
-    // Nómina → confirmado directo
     for (const n of nominas) {
       movsBatch.push({
         fecha: n.fecha || hoyColombia(),
@@ -1233,7 +1225,6 @@ for (const b of borradoresInfo) {
       });
     }
 
-    // Gastos → borradores
     for (const c of pendientes) {
       const { rubro } = categorizarConCache(c.descripcion);
       movsBatch.push({
@@ -1249,13 +1240,11 @@ for (const b of borradoresInfo) {
       });
     }
 
-    // 4) Escribir TODO en una sola llamada
+    // 5) Escribir todo en UNA sola llamada
     const filas = await appendMovimientosBatch(env, movsBatch);
 
-    // 5) Armar info para el mensaje
+    // 6) Preparar info de borradores
     const borradoresInfo = [];
-    let idx = 0;
-    for (const _ of nominas) idx++; // saltamos nóminas
     for (let i = 0; i < pendientes.length; i++) {
       const c = pendientes[i];
       const fila = filas[nominas.length + i];
@@ -1268,9 +1257,10 @@ for (const b of borradoresInfo) {
       });
     }
 
-    if (!chatId) return; // Cron silencioso
+    // 7) Si no hay chatId (cron silencioso), salir
+    if (!chatId) return;
 
-    // 6) Mensaje resumen
+    // 8) Armar mensaje
     let msg = `📧 <b>${candidatos.length} correo(s) nuevo(s)</b>\n\n`;
     if (nominas.length > 0) {
       msg += `💼 Registré ${nominas.length} nómina(s) automáticamente.\n\n`;
@@ -1286,19 +1276,22 @@ for (const b of borradoresInfo) {
       msg += `\nConfirma con ✅ o revisa uno por uno.`;
       await enviar(env, chatId, msg, {
         reply_markup: tecladoCorreos(borradoresInfo),
+        disable_web_page_preview: true,
       });
     } else if (nominas.length > 0 || ignoradosPorViejos > 0) {
-      await enviar(env, chatId, msg);
+      await enviar(env, chatId, msg, { disable_web_page_preview: true });
     }
   } catch (e) {
     console.log('[CORREOS] Error general:', e.message, e.stack);
     if (chatId) await enviar(env, chatId, `❌ Error procesando correos: ${e.message}`);
   }
 }
-async function handleCorreosConfirmarTodos(env, chatId) {
+
+async function handleCorreosConfirmarTodos(env, chatId, messageId) {
   try {
     const borradores = await listarBorradoresDeCorreo(env);
     if (borradores.length === 0) {
+      try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
       return enviar(env, chatId, '📭 No hay borradores de correo pendientes.');
     }
     let count = 0;
@@ -1307,6 +1300,7 @@ async function handleCorreosConfirmarTodos(env, chatId) {
       try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
       count++;
     }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `✅ Confirmados ${count} movimiento(s) de correo. Revisa /hoy.`);
   } catch (e) {
     console.log('[CORREOS_CONFIRMAR] Error:', e.message);
@@ -1314,7 +1308,7 @@ async function handleCorreosConfirmarTodos(env, chatId) {
   }
 }
 
-async function handleCorreosIgnorarTodos(env, chatId) {
+async function handleCorreosIgnorarTodos(env, chatId, messageId) {
   try {
     const borradores = await listarBorradoresDeCorreo(env);
     let count = 0;
@@ -1324,6 +1318,7 @@ async function handleCorreosIgnorarTodos(env, chatId) {
         count++;
       } catch (e) { /* noop */ }
     }
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `❌ Ignorados ${count} correo(s).`);
   } catch (e) {
     console.log('[CORREOS_IGNORAR] Error:', e.message);
@@ -1331,12 +1326,16 @@ async function handleCorreosIgnorarTodos(env, chatId) {
   }
 }
 
-async function handleCorreosVerIndividual(env, chatId) {
+async function handleCorreosVerIndividual(env, chatId, messageId) {
   try {
     const borradores = await listarBorradoresDeCorreo(env);
     if (borradores.length === 0) {
+      try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
       return enviar(env, chatId, '📭 No hay borradores de correo pendientes.');
     }
+    // Borramos el mensaje con los botones "confirmar/ignorar todos"
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    // Mandamos un borrador individual por cada correo
     for (const { fila, data: r } of borradores) {
       const valor = parsearValor(r[7]);
       const msg =
@@ -1606,15 +1605,15 @@ async function handleCallback(env, cq) {
   // ---------- C.6 CALLBACKS DE CORREOS ----------
 
   if (accion === 'correos_confirmar_todos') {
-    return handleCorreosConfirmarTodos(env, chatId);
+    return handleCorreosConfirmarTodos(env, chatId, messageId);
   }
 
   if (accion === 'correos_ignorar_todos') {
-    return handleCorreosIgnorarTodos(env, chatId);
+    return handleCorreosIgnorarTodos(env, chatId, messageId);
   }
 
   if (accion === 'correos_ver_individual') {
-    return handleCorreosVerIndividual(env, chatId);
+    return handleCorreosVerIndividual(env, chatId, messageId);
   }
 
   if (accion === 'correo_ver') {

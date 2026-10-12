@@ -13,6 +13,7 @@ export async function enviar(env, chatId, text, extra = {}) {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
+    disable_web_page_preview: true,
     ...extra,
   });
 }
@@ -23,6 +24,7 @@ export async function editarMensaje(env, chatId, messageId, text, extra = {}) {
     message_id: messageId,
     text,
     parse_mode: 'HTML',
+    disable_web_page_preview: true,
     ...extra,
   });
 }

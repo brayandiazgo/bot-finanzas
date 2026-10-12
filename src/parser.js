@@ -71,14 +71,14 @@ export function parsearCorreo(correo) {
   }
 
   // 2. NÓMINA / PAGO RECIBIDO
-  m = body.match(/Recibiste un pago de\s+(\w+)\s+de\s+(.+?)\s+por\s+\$([\d.,]+)\s+en tu cuenta de\s+(\w+)/i);
+  m = body.match(/Recibiste un pago de\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+)\s+de\s+(.+?)\s+por\s+\$([\d.,]+)\s+en tu cuenta de\s+(\w+)/i);
   if (m) {
     const tipoPago = m[1];
     const origen = m[2].trim();
     const monto = parsearMonto(m[3]);
     const cuenta = m[4];
     const fecha = parsearFecha(body);
-    const esNomina = tipoPago.toLowerCase().includes('nomina') || tipoPago.toLowerCase().includes('nómina');
+    const esNomina = /n[oó]mina/i.test(tipoPago);
     return {
       tipo: 'ingreso',
       monto,
