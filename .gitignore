@@ -1,6 +1,13 @@
 node_modules/
 .wrangler/
 .dev.vars
+.env
+*.pem
+*.key
+service-account*.json
 *.log
 .DS_Store
-.env
+Thumbs.db
+*.bak
+*.old
+df
