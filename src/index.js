@@ -9,12 +9,14 @@ import {
   tecladoCorreos, tecladoCorreoIndividual, tecladoResumenCorreos,
 } from './telegram.js';
 import {
-  appendMovimiento, leerMovimientos, leerMovimientoPorFila,
+  appendMovimiento, appendMovimientosBatch, obtenerProximaFila,
+  leerMovimientos, leerMovimientoPorFila,
   actualizarRubro, actualizarMedio, actualizarEstado,
   actualizarValor, actualizarDescripcion,
   guardarMsgId, limpiarMsgId, borrarFila,
   leerPresupuestoMes, parsearValor, normalizarFecha,
   limpiarBorradoresViejos, listarMovimientos, listarBorradores,
+  listarBorradoresDeCorreo,
   obtenerMsgIdsBorradores,
   leerAprendizaje, guardarAprendizaje, reemplazarAprendizaje,
   leerIdsCorreosExistentes, actualizarIdCorreo,
@@ -29,9 +31,9 @@ const MAX_BORRADORES = 5;
 const UMBRAL_APRENDIZAJE = 2;
 
 const RUBROS_KEYWORDS = {
-  'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada', 'otro gas', 'gas natural'],
+  'Gasolina': ['gasolina', 'eds', 'terpel', 'primax', 'texaco', 'combustible', 'tanqueada', 'gas natural'],
   'Alimentación': ['almuerzo', 'desayuno', 'comida', 'rappi', 'domicilio', 'restaurante', 'cafe', 'pan', 'arepa', 'tostado', 'hamburguesa', 'pizza', 'oblea', 'mecato', 'helado', 'fresas', 'empanada', 'sandwich', 'leche', 'queso', 'tinto', 'caldo', 'cena', 'mc donald', 'mcdonald'],
-  'Recibos': ['luz', 'agua', 'internet', 'celular', 'tigo', 'icloud', 'energia', 'energía', 'aseo', 'papel higienico', 'recibo', 'plan de datos'],
+  'Recibos': ['luz', 'agua', 'internet', 'celular', 'tigo', 'icloud', 'energia', 'energía', 'aseo', 'papel higienico', 'recibo', 'plan de datos', 'otro gas'],
   'Transporte': ['uber', 'didi', 'taxi', 'bus', 'transmilenio', 'sitp', 'parqueadero', 'pasaje'],
   'Cuidado personal': ['corte de cabello', 'corte cabello', 'uña', 'espi', 'medicamento', 'zapatos', 'peluqueria'],
   'Entretenimiento': ['spotify', 'youtube', 'apple', 'audifonos', 'cine', 'netflix', 'defensores de la fe', 'youtube premium'],
@@ -1137,6 +1139,9 @@ async function handleTestParser(env, chatId) {
 // ============================================================
 
 async function handleCorreos(env, chatId) {
+  const DIAS_MAX_ANTIGUEDAD = 5;   // Ignorar correos con más de N días
+  const MAX_POR_CORRIDA = 8;       // Máximo de correos a procesar por invocación
+
   try {
     const idsExistentes = await leerIdsCorreosExistentes(env);
     const listaGmail = await listarCorreosBancolombia(env, 30);
@@ -1146,77 +1151,122 @@ async function handleCorreos(env, chatId) {
       return;
     }
 
-    const nuevos = [];
+    // Fecha límite: correos más viejos se ignoran
+    const limiteMs = Date.now() - DIAS_MAX_ANTIGUEDAD * 24 * 60 * 60 * 1000;
+
+    // 1) Leer correos (esto sí consume subrequests: 1 por correo)
+    const candidatos = [];
+    let ignoradosPorViejos = 0;
     for (const m of listaGmail) {
       if (idsExistentes.has(String(m.id).trim())) continue;
       try {
         const correo = await leerCorreo(env, m.id);
-        const parsed = parsearCorreo(correo);
-        if (parsed) {
-          nuevos.push({ id: m.id, ...parsed });
+        // Filtro por fecha del header
+        if (correo.fecha) {
+          const fechaMs = Date.parse(correo.fecha);
+          if (!isNaN(fechaMs) && fechaMs < limiteMs) {
+            ignoradosPorViejos++;
+            continue;
+          }
         }
+        const parsed = parsearCorreo(correo);
+        if (parsed) candidatos.push({ id: m.id, ...parsed });
       } catch (e) {
         console.log('[CORREOS] Error leyendo', m.id, e.message);
       }
+      // Cortamos el bucle si ya tenemos suficientes
+      if (candidatos.length >= MAX_POR_CORRIDA) break;
     }
 
-    if (nuevos.length === 0) {
-      if (chatId) await enviar(env, chatId, '✅ No hay correos nuevos para registrar.');
+    if (candidatos.length === 0) {
+      let msg = '✅ No hay correos nuevos para registrar.';
+      if (ignoradosPorViejos > 0) {
+        msg += `\n(${ignoradosPorViejos} correo(s) viejo(s) ignorado(s) — más de ${DIAS_MAX_ANTIGUEDAD} días)`;
+      }
+      if (chatId) await enviar(env, chatId, msg);
       return;
     }
 
-    // Nómina se registra directo
-    const nominas = nuevos.filter(c => c.esNomina);
-    const pendientes = nuevos.filter(c => !c.esNomina);
+    // 2) Cargar aprendizaje UNA sola vez
+    const aprend = await leerAprendizaje(env);
 
+    function categorizarConCache(desc) {
+      const directo = categorizarBasico(desc);
+      if (directo) return { rubro: directo, fuente: 'diccionario' };
+      const descNorm = normalizar(desc);
+      const primera = primeraPalabra(desc);
+      const exacta = aprend.find(a => a.tipo === 'descripcion' && a.palabra === descNorm && a.veces >= UMBRAL_APRENDIZAJE);
+      if (exacta) return { rubro: exacta.rubro, fuente: 'aprendizaje-desc' };
+      const porPrimera = aprend.find(a => a.tipo === 'palabra' && a.palabra === primera && a.veces >= UMBRAL_APRENDIZAJE);
+      if (porPrimera) return { rubro: porPrimera.rubro, fuente: 'aprendizaje-palabra' };
+      return { rubro: 'Otro', fuente: 'ninguna' };
+    }
+
+    // 3) Armar el batch de movimientos
+    const nominas = candidatos.filter(c => c.esNomina);
+    const pendientes = candidatos.filter(c => !c.esNomina);
+
+    const movsBatch = [];
+
+    // Nómina → confirmado directo
     for (const n of nominas) {
-      try {
-        const fila = await appendMovimiento(env, {
-          fecha: n.fecha || hoyColombia(),
-          rubro: 'Salario',
-          valor: n.monto,
-          descripcion: n.descripcion,
-          medio: n.medio || 'Transferencia',
-          tipo: 'Ingreso',
-          fuente: 'correo',
-          estado: 'confirmado',
-          id_correo: n.id,
-        });
-        await actualizarIdCorreo(env, fila, n.id);
-      } catch (e) {
-        console.log('[CORREOS] Error registrando nómina:', e.message);
-      }
+      movsBatch.push({
+        fecha: n.fecha || hoyColombia(),
+        rubro: 'Salario',
+        valor: n.monto,
+        descripcion: n.descripcion,
+        medio: n.medio || 'Transferencia',
+        tipo: 'Ingreso',
+        fuente: 'correo',
+        estado: 'confirmado',
+        id_correo: n.id,
+      });
     }
 
-    // Gastos: crear borradores
-    const borradoresInfo = [];
+    // Gastos → borradores
     for (const c of pendientes) {
-      try {
-        const { rubro } = await categorizarConAprendizaje(env, c.descripcion);
-        const fila = await appendMovimiento(env, {
-          fecha: c.fecha || hoyColombia(),
-          rubro,
-          valor: -Math.abs(c.monto),
-          descripcion: c.descripcion,
-          medio: c.medio || 'Debito',
-          tipo: 'Gasto',
-          fuente: 'correo',
-          estado: 'pendiente',
-          id_correo: c.id,
-        });
-        await actualizarIdCorreo(env, fila, c.id);
-        borradoresInfo.push({ fila, id: c.id, descripcion: c.descripcion, monto: c.monto, esIngreso: false });
-      } catch (e) {
-        console.log('[CORREOS] Error creando borrador:', e.message);
-      }
+      const { rubro } = categorizarConCache(c.descripcion);
+      movsBatch.push({
+        fecha: c.fecha || hoyColombia(),
+        rubro,
+        valor: -Math.abs(c.monto),
+        descripcion: c.descripcion,
+        medio: c.medio || 'Debito',
+        tipo: 'Gasto',
+        fuente: 'correo',
+        estado: 'pendiente',
+        id_correo: c.id,
+      });
     }
 
-    if (!chatId) return; // Cron silencioso si no hay chatId
+    // 4) Escribir TODO en una sola llamada
+    const filas = await appendMovimientosBatch(env, movsBatch);
 
-    // Mensaje resumen
-    let msg = `📧 <b>${borradoresInfo.length} correo(s) nuevo(s) para revisar</b>\n\n`;
+    // 5) Armar info para el mensaje
+    const borradoresInfo = [];
+    let idx = 0;
+    for (const _ of nominas) idx++; // saltamos nóminas
+    for (let i = 0; i < pendientes.length; i++) {
+      const c = pendientes[i];
+      const fila = filas[nominas.length + i];
+      borradoresInfo.push({
+        fila,
+        id: c.id,
+        descripcion: c.descripcion,
+        monto: c.monto,
+        esIngreso: false,
+      });
+    }
+
+    if (!chatId) return; // Cron silencioso
+
+    // 6) Mensaje resumen
+    let msg = `📧 <b>${candidatos.length} correo(s) nuevo(s)</b>\n\n`;
     if (nominas.length > 0) {
       msg += `💼 Registré ${nominas.length} nómina(s) automáticamente.\n\n`;
+    }
+    if (ignoradosPorViejos > 0) {
+      msg += `⏭️ Ignoré ${ignoradosPorViejos} correo(s) viejo(s).\n\n`;
     }
     for (const b of borradoresInfo) {
       msg += `➖ $${fmt(b.monto)} — ${b.descripcion}\n`;
@@ -1227,7 +1277,7 @@ async function handleCorreos(env, chatId) {
       await enviar(env, chatId, msg, {
         reply_markup: tecladoCorreos(borradoresInfo),
       });
-    } else if (nominas.length > 0) {
+    } else if (nominas.length > 0 || ignoradosPorViejos > 0) {
       await enviar(env, chatId, msg);
     }
   } catch (e) {
@@ -1235,12 +1285,11 @@ async function handleCorreos(env, chatId) {
     if (chatId) await enviar(env, chatId, `❌ Error procesando correos: ${e.message}`);
   }
 }
-
 async function handleCorreosConfirmarTodos(env, chatId) {
   try {
-    const borradores = await listarBorradores(env);
+    const borradores = await listarBorradoresDeCorreo(env);
     if (borradores.length === 0) {
-      return enviar(env, chatId, '📭 No hay borradores pendientes.');
+      return enviar(env, chatId, '📭 No hay borradores de correo pendientes.');
     }
     let count = 0;
     for (const { fila } of borradores) {
@@ -1248,7 +1297,7 @@ async function handleCorreosConfirmarTodos(env, chatId) {
       try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
       count++;
     }
-    return enviar(env, chatId, `✅ Confirmados ${count} movimiento(s). Revisa /hoy.`);
+    return enviar(env, chatId, `✅ Confirmados ${count} movimiento(s) de correo. Revisa /hoy.`);
   } catch (e) {
     console.log('[CORREOS_CONFIRMAR] Error:', e.message);
     return enviar(env, chatId, `❌ Error: ${e.message}`);
@@ -1257,7 +1306,7 @@ async function handleCorreosConfirmarTodos(env, chatId) {
 
 async function handleCorreosIgnorarTodos(env, chatId) {
   try {
-    const borradores = await listarBorradores(env);
+    const borradores = await listarBorradoresDeCorreo(env);
     let count = 0;
     for (const { fila } of borradores) {
       try {
@@ -1274,9 +1323,9 @@ async function handleCorreosIgnorarTodos(env, chatId) {
 
 async function handleCorreosVerIndividual(env, chatId) {
   try {
-    const borradores = await listarBorradores(env);
+    const borradores = await listarBorradoresDeCorreo(env);
     if (borradores.length === 0) {
-      return enviar(env, chatId, '📭 No hay borradores pendientes.');
+      return enviar(env, chatId, '📭 No hay borradores de correo pendientes.');
     }
     for (const { fila, data: r } of borradores) {
       const valor = parsearValor(r[7]);

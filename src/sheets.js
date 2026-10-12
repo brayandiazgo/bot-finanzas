@@ -304,6 +304,12 @@ export async function listarBorradores(env) {
   return resultado;
 }
 
+// Solo los borradores que vinieron de correo (fuente === 'correo')
+export async function listarBorradoresDeCorreo(env) {
+  const todos = await listarBorradores(env);
+  return todos.filter(({ data: r }) => (r[11] || '').toLowerCase() === 'correo');
+}
+
 export async function obtenerMsgIdsBorradores(env) {
   const data = await sheetsRequest(
     env,
@@ -447,7 +453,6 @@ export async function reemplazarAprendizaje(env, datos) {
 
 // ---------- C.6: IDs de correos ----------
 
-// Devuelve un Set con todos los id_correo ya registrados en MOVIMIENTOS (columna N)
 export async function leerIdsCorreosExistentes(env) {
   const data = await sheetsRequest(
     env,
@@ -462,10 +467,57 @@ export async function leerIdsCorreosExistentes(env) {
   return ids;
 }
 
-// Actualiza el id_correo de una fila (columna N)
 export async function actualizarIdCorreo(env, fila, idCorreo) {
   return sheetsRequest(env, `/values/MOVIMIENTOS!N${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
     body: JSON.stringify({ values: [[idCorreo]] }),
   });
+}
+
+// ---------- C.6 OPTIMIZACIONES ----------
+
+// Devuelve la próxima fila libre en MOVIMIENTOS leyendo solo la columna B
+export async function obtenerProximaFila(env) {
+  const data = await sheetsRequest(env, `/values/MOVIMIENTOS!B:B`);
+  const rows = data.values || [];
+  let ultimaConDato = 1;
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i] && rows[i][0]) ultimaConDato = i + 1;
+  }
+  return ultimaConDato + 1;
+}
+
+// Escribe varios movimientos en una sola llamada (batch)
+// movs: array de objetos { fecha, rubro, valor, descripcion, medio, tipo, fuente, estado, id_correo, nota }
+// Devuelve array de filas escritas
+export async function appendMovimientosBatch(env, movs) {
+  if (movs.length === 0) return [];
+  const filaIni = await obtenerProximaFila(env);
+  const filas = [];
+  const values = [];
+
+  for (let i = 0; i < movs.length; i++) {
+    const fila = filaIni + i;
+    const mov = movs[i];
+    const f = formulasFila(fila);
+    values.push([
+      f.A, mov.fecha, f.C, f.D, f.E, f.F,
+      mov.rubro, mov.valor, mov.descripcion || '', mov.medio || 'Efectivo',
+      mov.tipo, mov.fuente || 'manual', mov.estado || 'pendiente',
+      mov.id_correo || '', mov.nota || '', '',
+    ]);
+    filas.push(fila);
+  }
+
+  const filaFin = filaIni + movs.length - 1;
+  await sheetsRequest(
+    env,
+    `/values/MOVIMIENTOS!A${filaIni}:P${filaFin}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ values }),
+    }
+  );
+
+  return filas;
 }

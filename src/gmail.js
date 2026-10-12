@@ -65,7 +65,6 @@ export async function leerCorreo(env, messageId) {
   if (bodyB64) {
     const b64 = bodyB64.replace(/-/g, '+').replace(/_/g, '/');
     try {
-      // Decodifica base64url como UTF-8 (arregla los "Ã³" etc.)
       const raw = atob(b64);
       const bytes = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
@@ -101,38 +100,4 @@ export async function verPrimerCorreo(env) {
   if (lista.length === 0) return null;
   const correo = await leerCorreo(env, lista[0].id);
   return correo;
-}
-
-// ============================================================
-// C.6 — Leer IDs de correo ya registrados (columna N)
-// ============================================================
-export async function leerIdsCorreosExistentes(env) {
-  const sheet = await getSheet(env, "MOVIMIENTOS");
-  const rows = await sheet.getRows();
-
-  const ids = new Set();
-  for (const row of rows) {
-    const idCorreo = row.get("id_correo");
-    if (idCorreo && String(idCorreo).trim() !== "") {
-      ids.add(String(idCorreo).trim());
-    }
-  }
-  return ids;
-}
-
-// ============================================================
-// C.6 — Guardar id_correo en la fila recién creada
-// ============================================================
-export async function guardarIdCorreo(env, idMovimiento, idCorreo) {
-  const sheet = await getSheet(env, "MOVIMIENTOS");
-  const rows = await sheet.getRows();
-
-  for (const row of rows) {
-    if (String(row.get("id")) === String(idMovimiento)) {
-      row.set("id_correo", idCorreo);
-      await row.save();
-      return true;
-    }
-  }
-  return false;
 }

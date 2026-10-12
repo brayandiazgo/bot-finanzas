@@ -155,12 +155,13 @@ export function tecladoRevisar(filas) {
 
 // ---------- TECLADOS PARA CORREOS ----------
 
-// ---------- TECLADOS PARA CORREOS ----------
-
 export function tecladoCorreos(lista) {
   const botones = [];
   botones.push([
     { text: '✅ Confirmar todos', callback_data: 'correos_confirmar_todos' },
+    { text: '🔍 Ver uno por uno', callback_data: 'correos_ver_individual' },
+  ]);
+  botones.push([
     { text: '❌ Ignorar todos', callback_data: 'correos_ignorar_todos' },
   ]);
   for (const c of lista) {
