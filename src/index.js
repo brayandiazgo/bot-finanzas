@@ -210,11 +210,17 @@ async function buscarDuplicado(env, descripcion, monto) {
 function textoBorrador(fecha, rubro, valor, desc, medio) {
   const fechaFmt = normalizarFecha(fecha);
   return (
-    `<b>$${fmt(Math.abs(valor))}</b> — ${desc}\n` +
+    `<b>$${fmt(Math.abs(valor))}</b> — ${escaparHTML(desc)}\n` +
     `Fecha: <i>${fechaFmt}</i>\n` +
-    `Rubro: <i>${rubro}</i>\n` +
-    `Medio: <i>${medio}</i>`
+    `Rubro: <i>${escaparHTML(rubro)}</i>\n` +
+    `Medio: <i>${escaparHTML(medio)}</i>`
   );
+function escaparHTML(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 }
 
 async function borrarMensajesDeBorradoresViejos(env, chatId) {
@@ -1141,6 +1147,10 @@ async function handleTestParser(env, chatId) {
 async function handleCorreos(env, chatId) {
   const DIAS_MAX_ANTIGUEDAD = 5;   // Ignorar correos con más de N días
   const MAX_POR_CORRIDA = 8;       // Máximo de correos a procesar por invocación
+
+for (const b of borradoresInfo) {
+  msg += `➖ $${fmt(b.monto)} — ${escaparHTML(b.descripcion)}\n`;
+}
 
   try {
     const idsExistentes = await leerIdsCorreosExistentes(env);
