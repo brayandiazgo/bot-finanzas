@@ -140,3 +140,15 @@ export function tecladoBorradores(filas) {
   }
   return { inline_keyboard: botones };
 }
+
+export function tecladoRevisar(filas) {
+  const botones = [];
+  for (const b of filas) {
+    botones.push([
+      { text: `✏️ #${b.fila}`, callback_data: `volver:${b.fila}` },
+      { text: `🗑️ #${b.fila}`, callback_data: `cancelar:${b.fila}` },
+    ]);
+  }
+  botones.push([{ text: '➡️ Siguientes', callback_data: 'revisar_siguientes' }]);
+  return { inline_keyboard: botones };
+}

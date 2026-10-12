@@ -5,6 +5,7 @@ import {
   tecladoRubros, tecladoMedios, tecladoDuplicado,
   tecladoBorrarConfirmar, tecladoListado,
   tecladoConfirmarEliminar, tecladoBorradores,
+  tecladoRevisar,
 } from './telegram.js';
 import {
   appendMovimiento, leerMovimientos, leerMovimientoPorFila,
@@ -272,11 +273,19 @@ async function calcularResumen(env) {
   };
 }
 
+function saludoSegunHora() {
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
+  const h = d.getHours();
+  if (h >= 5 && h < 12) return '☀️ Buenos días';
+  if (h >= 12 && h < 19) return '🌤️ Buenas tardes';
+  return '🌙 Buenas noches';
+}
+
 function mensajeResumen(data) {
   const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
   const mesNombre = MESES[data.mesNum - 1];
 
-  let msg = `☀️ <b>Buenos días Brayan</b>\n\n`;
+  let msg = `${saludoSegunHora()} <b>Brayan</b>\n\n`;
   msg += `📅 Quedan <b>${data.diasRestantes}</b> días de ${mesNombre}\n\n`;
 
   if (data.totalPresupuesto > 0) {
@@ -288,7 +297,13 @@ function mensajeResumen(data) {
     msg += `<b>Rubros más ajustados:</b>\n`;
     for (const r of data.topAjustados) {
       const icono = r.pct > 100 ? '🔴' : r.pct >= 80 ? '🟡' : '🟢';
-      msg += `${icono} <b>${r.rubro}</b>: $${fmt(r.disponible)} disponibles\n`;
+      if (r.disponible < 0) {
+        msg += `${icono} <b>${r.rubro}</b>: <b>EXCEDIDO en $${fmt(Math.abs(r.disponible))}</b>\n`;
+      } else if (r.disponible === 0) {
+        msg += `${icono} <b>${r.rubro}</b>: agotado\n`;
+      } else {
+        msg += `${icono} <b>${r.rubro}</b>: $${fmt(r.disponible)} disponibles\n`;
+      }
       msg += `   (gastaste $${fmt(r.gastado)} de $${fmt(r.monto)})\n`;
     }
   } else {
@@ -321,7 +336,8 @@ async function handleStart(env, chatId) {
     `/borrar N — eliminar el movimiento N\n` +
     `/valor N 5000 — cambiar el monto\n` +
     `/desc N texto — cambiar la descripción\n\n` +
-    `<b>Aprendizaje:</b>\n` +
+    `<b>Mantenimiento:</b>\n` +
+    `/revisar — movimientos con rubro "Otro" o sin descripción\n` +
     `/aprender — cargar aprendizaje desde el histórico\n` +
     `/aprendizaje — ver la tabla de aprendizaje\n\n` +
     `/ayuda`
@@ -366,15 +382,19 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
     tipo: 'Gasto', fuente: 'manual', estado: 'pendiente',
   });
 
-  const emojiFuente = fuente === 'diccionario' ? '📚'
-    : fuente === 'aprendizaje-desc' ? '🎓'
-    : fuente === 'aprendizaje-palabra' ? '🎓'
-    : '❓';
+  let lineaFuente;
+  if (fuente === 'diccionario') {
+    lineaFuente = `📚 Categorizado con diccionario`;
+  } else if (fuente === 'aprendizaje-desc' || fuente === 'aprendizaje-palabra') {
+    lineaFuente = `🎓 Categorizado con aprendizaje`;
+  } else {
+    lineaFuente = `❓ Sin categoría. Usa ✏️ Rubro para asignarla`;
+  }
 
   const msgResp = await enviar(env, chatId,
     `🕒 <b>Borrador</b> (fila ${fila})\n` +
     textoBorrador(fecha, rubro, -monto, desc, medioFinal) +
-    `\n\n${emojiFuente} Categorizado por: <i>${fuente}</i>` +
+    `\n\n${lineaFuente}` +
     `\n\nPresiona ✅ para guardar:`,
     { reply_markup: tecladoBorrador(fila) }
   );
@@ -675,6 +695,48 @@ async function handleDesc(env, chatId, texto) {
   return enviar(env, chatId, `✅ Fila ${fila} → "${nuevaDesc}"`);
 }
 
+async function handleRevisar(env, chatId, offset = 0) {
+  const hoy = hoyColombia();
+  const hace3m = new Date();
+  hace3m.setMonth(hace3m.getMonth() - 3);
+  const desde = hace3m.toISOString().slice(0, 10);
+
+  const rows = await leerMovimientos(env, desde, hoy, true);
+
+  // Filtrar sospechosos
+  const sospechosos = rows.filter(({ data: r }) => {
+    const rubro = r[6] || '';
+    const desc = r[8] || '';
+    if (rubro === 'Otro') return true;
+    if (!desc) return true;
+    if (desc.length < 3) return true;
+    return false;
+  });
+
+  if (sospechosos.length === 0) {
+    return enviar(env, chatId, '✅ No hay movimientos sospechosos en los últimos 3 meses.');
+  }
+
+  const items = sospechosos.slice(offset, offset + 5);
+  const total = sospechosos.length;
+
+  let msg = `🔍 <b>Movimientos a revisar</b> (${offset + 1}-${Math.min(offset + 5, total)} de ${total})\n\n`;
+  for (const { fila, data: r } of items) {
+    const valor = parsearValor(r[7]);
+    const signo = valor < 0 ? '➖' : '➕';
+    const fecha = normalizarFecha(r[1]);
+    const medio = r[9] || 'Efectivo';
+    const rubro = r[6] || '?';
+    const desc = r[8] || '(sin descripción)';
+    msg += `<b>#${fila}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))}\n`;
+    msg += `   "${desc}"\n`;
+    msg += `   Rubro actual: <i>${rubro}</i> · ${medio}\n\n`;
+  }
+  msg += `Toca ✏️ #N para corregir el rubro, 🗑️ #N para eliminarla.`;
+
+  return enviar(env, chatId, msg, { reply_markup: tecladoRevisar(items) });
+}
+
 async function handleAprender(env, chatId) {
   await enviar(env, chatId, `🧠 Analizando tu histórico para aprender patrones... (puede tardar 10 segundos)`);
 
@@ -780,6 +842,11 @@ async function handleMensaje(env, msg) {
   if (texto.startsWith('/presupuesto')) return handlePresupuesto(env, chatId);
   if (texto.startsWith('/listar')) return handleListar(env, chatId, 0);
   if (texto.startsWith('/borradores')) return handleBorradores(env, chatId);
+  if (texto.startsWith('/revisar')) {
+    const m = texto.match(/^\/revisar\s+(\d+)/);
+    const offset = m ? Number(m[1]) : 0;
+    return handleRevisar(env, chatId, offset);
+  }
   if (texto.startsWith('/aprender')) return handleAprender(env, chatId);
   if (texto.startsWith('/aprendizaje')) return handleVerAprendizaje(env, chatId);
 
