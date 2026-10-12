@@ -234,7 +234,7 @@ async function borrarMensajesDeBorradoresViejos(env, chatId) {
 
 // ---------- C.4: ALERTAS ----------
 
-async function verificarAlertas(env, chatId) {
+async function verificarAlertas(env, chatId, rubroTocado = null) {
   try {
     const hoy = hoyColombia();
     const año = Number(hoy.slice(0, 4));
@@ -257,21 +257,27 @@ async function verificarAlertas(env, chatId) {
       if (p.monto <= 0) continue;
       const gastado = porRubro[p.rubro] || 0;
       const pct = (gastado / p.monto) * 100;
+      const esRubroTocado = rubroTocado && p.rubro === rubroTocado;
 
       for (const umbral of [80, 100]) {
         if (pct >= umbral) {
           const key = `${mesKey}:${p.rubro}:${umbral}`;
           if (!alertasEnviadas.has(key)) {
-            const icono = umbral === 100 ? '🚨' : '⚠️';
-            const nivel = umbral === 100 ? '<b>EXCEDIDO</b>' : 'cerca del límite';
-            await enviar(env, chatId,
-              `${icono} <b>Alerta de presupuesto</b>\n\n` +
-              `<b>${p.rubro}</b>: ${nivel}\n` +
-              `Gastado: $${fmt(gastado)} de $${fmt(p.monto)} (${pct.toFixed(0)}%)\n` +
-              (umbral === 100
-                ? `Excedido en $${fmt(gastado - p.monto)}`
-                : `Disponible: $${fmt(p.monto - gastado)}`)
-            );
+            // Solo mandar mensaje si es el rubro que se acaba de tocar
+            // o si es un rubro nuevo (no existía en el barrido inicial)
+            if (esRubroTocado) {
+              const icono = umbral === 100 ? '🚨' : '⚠️';
+              const nivel = umbral === 100 ? '<b>EXCEDIDO</b>' : 'cerca del límite';
+              await enviar(env, chatId,
+                `${icono} <b>Alerta de presupuesto</b>\n\n` +
+                `<b>${p.rubro}</b>: ${nivel}\n` +
+                `Gastado: $${fmt(gastado)} de $${fmt(p.monto)} (${pct.toFixed(0)}%)\n` +
+                (umbral === 100
+                  ? `Excedido en $${fmt(gastado - p.monto)}`
+                  : `Disponible: $${fmt(p.monto - gastado)}`)
+              );
+            }
+            // En cualquier caso, marcar como enviada para no repetir
             await guardarAlerta(env, mesKey, p.rubro, umbral);
           }
         }
@@ -1453,14 +1459,19 @@ async function handleCorreosConfirmarTodos(env, chatId, messageId) {
       try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
       return enviar(env, chatId, '📭 No hay borradores de correo pendientes.');
     }
+    const rubrosTocados = new Set();
     let count = 0;
-    for (const { fila } of borradores) {
+    for (const { fila, data: r } of borradores) {
       await actualizarEstado(env, fila, 'confirmado');
       try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
+      if (r[6]) rubrosTocados.add(r[6]);
       count++;
     }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    await verificarAlertas(env, chatId);
+    // Verificar alertas de cada rubro tocado
+    for (const rubro of rubrosTocados) {
+      await verificarAlertas(env, chatId, rubro);
+    }
     return enviar(env, chatId, `✅ Confirmados ${count} movimiento(s) de correo. Revisa /hoy.`);
   } catch (e) {
     console.log('[CORREOS_CONFIRMAR] Error:', e.message);
@@ -1605,22 +1616,21 @@ async function handleCallback(env, cq) {
   const [accion, ...params] = data.split(':');
 
   if (accion === 'ok') {
-    const fila = Number(params[0]);
-    await actualizarEstado(env, fila, 'confirmado');
-    try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
-    const r = await leerMovimientoPorFila(env, fila);
-    const valor = parsearValor(r?.[7]);
-    const desc = r?.[8] || '';
-    const rubro = r?.[6] || '';
-    const medio = r?.[9] || '';
-    const id = String(r?.[0] || fila).trim();
-    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
-    // Verificar alertas después de guardar
-    await verificarAlertas(env, chatId);
-    return enviar(env, chatId,
-      `✅ <b>Guardado</b> (ID ${id})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
-    );
-  }
+  const fila = Number(params[0]);
+  await actualizarEstado(env, fila, 'confirmado');
+  try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
+  const r = await leerMovimientoPorFila(env, fila);
+  const valor = parsearValor(r?.[7]);
+  const desc = r?.[8] || '';
+  const rubro = r?.[6] || '';
+  const medio = r?.[9] || '';
+  const id = String(r?.[0] || fila).trim();
+  try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+  await verificarAlertas(env, chatId, rubro);
+  return enviar(env, chatId,
+    `✅ <b>Guardado</b> (ID ${id})\n<b>$${fmt(Math.abs(valor))}</b> — ${desc}\nRubro: <i>${rubro}</i>\nMedio: <i>${medio}</i>`
+  );
+}
 
   if (accion === 'cancelar') {
     const fila = Number(params[0]);
