@@ -1371,7 +1371,7 @@ async function handleTestParser(env, chatId) {
 // C.6 — HANDLERS DE CORREOS
 // ============================================================
 
-async function handleCorreos(env, chatId) {
+async function handleCorreos(env, chatId, silencioso = false) {
   const DIAS_MAX_ANTIGUEDAD = 5;
   const MAX_POR_CORRIDA = 8;
 
@@ -1380,7 +1380,7 @@ async function handleCorreos(env, chatId) {
     const listaGmail = await listarCorreosBancolombia(env, 30);
 
     if (listaGmail.length === 0) {
-      if (chatId) await enviar(env, chatId, '📭 No hay correos etiquetados.');
+      if (chatId && !silencioso) await enviar(env, chatId, '📭 No hay correos etiquetados.');
       return;
     }
 
@@ -1407,8 +1407,11 @@ async function handleCorreos(env, chatId) {
       if (candidatos.length >= MAX_POR_CORRIDA) break;
     }
 
+    // Si no hay candidatos:
+    // - modo manual (silencioso=false) → responde
+    // - modo cron (silencioso=true) → silencio total
     if (candidatos.length === 0) {
-      if (chatId) {
+      if (chatId && !silencioso) {
         let msgVacio = '✅ No hay correos nuevos para registrar.';
         if (ignoradosPorViejos > 0) {
           msgVacio += `\n(${ignoradosPorViejos} correo(s) viejo(s) ignorado(s) — más de ${DIAS_MAX_ANTIGUEDAD} días)`;
@@ -1418,6 +1421,7 @@ async function handleCorreos(env, chatId) {
       return;
     }
 
+    // ... (resto igual: aprendizaje, batch, borradores, etc.)
     const aprend = await leerAprendizaje(env);
 
     function categorizarConCache(desc) {
@@ -1486,9 +1490,6 @@ async function handleCorreos(env, chatId) {
     if (nominas.length > 0) {
       msg += `💼 Registré ${nominas.length} nómina(s) automáticamente.\n\n`;
     }
-    if (ignoradosPorViejos > 0) {
-      msg += `⏭️ Ignoré ${ignoradosPorViejos} correo(s) viejo(s).\n\n`;
-    }
     for (const b of borradoresInfo) {
       msg += `➖ $${fmt(b.monto)} — ${b.descripcion}\n`;
     }
@@ -1498,15 +1499,14 @@ async function handleCorreos(env, chatId) {
       await enviar(env, chatId, msg, {
         reply_markup: tecladoCorreos(borradoresInfo),
       });
-    } else if (nominas.length > 0 || ignoradosPorViejos > 0) {
+    } else if (nominas.length > 0) {
       await enviar(env, chatId, msg);
     }
   } catch (e) {
     console.log('[CORREOS] Error general:', e.message, e.stack);
-    if (chatId) await enviar(env, chatId, `❌ Error procesando correos: ${e.message}`);
+    if (chatId && !silencioso) await enviar(env, chatId, `❌ Error procesando correos: ${e.message}`);
   }
 }
-
 async function handleCorreosConfirmarTodos(env, chatId, messageId) {
   try {
     const borradores = await listarBorradoresDeCorreo(env);
@@ -1921,47 +1921,47 @@ export default {
     if (url.pathname === '/') return new Response('Bot finanzas activo');
     return new Response('Not found', { status: 404 });
   },
-
-  async scheduled(event, env, ctx) {
-    try {
-      if (event.cron === '0 11 * * *') {
-        const chatId = env.TELEGRAM_CHAT_ID;
-        const data = await calcularResumen(env);
-        if (data.totalPresupuesto > 0) {
-          await enviar(env, chatId, mensajeResumen(data));
-        }
-      } else if (event.cron === '0 12 1 * *') {
-        console.log('Cron mensual disparado:', new Date().toISOString());
-      } else if (event.cron === '0 23 28-31 * *') {
-        const hoyCol = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
-        const ultimoDia = new Date(hoyCol.getFullYear(), hoyCol.getMonth() + 1, 0).getDate();
-        if (hoyCol.getDate() === ultimoDia) {
-          // C.5: análisis mensual automático
-          const chatId = env.TELEGRAM_CHAT_ID;
-          try {
-            const data = await calcularSugerenciaMensual(env);
-            if (data.sugerencia.length > 0) {
-              await enviar(env, chatId, mensajeSugerencia(data), {
-                reply_markup: tecladoAplicarPresupuesto(data.añoProx, data.mesProx),
-              });
-            }
-          } catch (e) {
-            console.log('[C.5] Error análisis mensual:', e.message);
-          }
-        }
-      } else if (event.cron === '*/30 * * * *') {
-        const resultado = await limpiarBorradoresViejos(env);
-        console.log(`Limpieza de borradores: ${resultado.borradas} filas borradas`);
-        const chatId = env.TELEGRAM_CHAT_ID;
-        for (const msgId of resultado.msgs) {
-          try { await borrarMensaje(env, chatId, msgId); } catch (e) { /* noop */ }
-        }
-      } else if (event.cron === '*/15 * * * *') {
-        const chatId = env.TELEGRAM_CHAT_ID;
-        await handleCorreos(env, chatId);
+}
+async function scheduled(event, env, ctx) {
+  try {
+    if (event.cron === '0 11 * * *') {
+      // 6:00 AM Colombia → resumen AM
+      const chatId = env.TELEGRAM_CHAT_ID;
+      const data = await calcularResumen(env);
+      if (data.totalPresupuesto > 0) {
+        await enviar(env, chatId, mensajeResumen(data));
       }
-    } catch (e) {
-      console.log('Error en cron:', e.message, e.stack);
+    } else if (event.cron === '0 23 * * *') {
+      // 6:00 PM Colombia → correos (silencioso)
+      const chatId = env.TELEGRAM_CHAT_ID;
+      await handleCorreos(env, chatId, true);
+    } else if (event.cron === '0 12 1 * *') {
+      console.log('Cron mensual disparado:', new Date().toISOString());
+    } else if (event.cron === '0 23 28-31 * *') {
+      const hoyCol = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
+      const ultimoDia = new Date(hoyCol.getFullYear(), hoyCol.getMonth() + 1, 0).getDate();
+      if (hoyCol.getDate() === ultimoDia) {
+        const chatId = env.TELEGRAM_CHAT_ID;
+        try {
+          const data = await calcularSugerenciaMensual(env);
+          if (data.sugerencia.length > 0) {
+            await enviar(env, chatId, mensajeSugerencia(data), {
+              reply_markup: tecladoAplicarPresupuesto(data.añoProx, data.mesProx),
+            });
+          }
+        } catch (e) {
+          console.log('[C.5] Error análisis mensual:', e.message);
+        }
+      }
+    } else if (event.cron === '*/30 * * * *') {
+      const resultado = await limpiarBorradoresViejos(env);
+      console.log(`Limpieza de borradores: ${resultado.borradas} filas borradas`);
+      const chatId = env.TELEGRAM_CHAT_ID;
+      for (const msgId of resultado.msgs) {
+        try { await borrarMensaje(env, chatId, msgId); } catch (e) { /* noop */ }
+      }
     }
-  },
-};
+  } catch (e) {
+    console.log('Error en cron:', e.message, e.stack);
+  }
+}
