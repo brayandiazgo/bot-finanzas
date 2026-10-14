@@ -15,3 +15,7 @@ crons = [
   "0 23 28-31 * *",   # 6:00 PM últimos días → análisis mensual
   "*/30 * * * *"      # cada 30 min → limpieza borradores
 ]
+
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "32d089623c4b4c48ba0e2196c8a6e123"

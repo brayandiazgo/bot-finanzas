@@ -192,8 +192,6 @@ export function tecladoCorreoIndividual(fila) {
   };
 }
 
-// ---------- C.5: TECLADO PARA APLICAR PRESUPUESTO ----------
-
 export function tecladoAplicarPresupuesto(año, mesNum) {
   return {
     inline_keyboard: [[

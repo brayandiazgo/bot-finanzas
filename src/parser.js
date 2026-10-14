@@ -91,7 +91,25 @@ export function parsearCorreo(correo) {
     };
   }
 
-  // 3. TRANSFERENCIA RECIBIDA
+  // 3a. TRANSFERENCIA RECIBIDA (formato nuevo: "Recibiste una transferencia por $X de NOMBRE")
+  m = body.match(/Recibiste\s+una\s+transferencia\s+por\s+\$([\d.,]+)\s+de\s+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]+?)\s+en\s+tu\s+cuenta/i);
+  if (m) {
+    const monto = parsearMonto(m[1]);
+    const origen = m[2].trim();
+    const fecha = parsearFecha(body);
+    return {
+      tipo: 'ingreso',
+      monto,
+      descripcion: `Transferencia de ${origen}`,
+      medio: 'Transferencia',
+      fecha,
+      esIngreso: true,
+      esNomina: false,
+      nota: `Transferencia recibida de ${origen}`,
+    };
+  }
+
+  // 3b. TRANSFERENCIA RECIBIDA (formato viejo: "Recibiste una transferencia de NOMBRE por $X")
   m = body.match(/Recibiste\s+una\s+transferencia\s+de\s+(.+?)\s+por\s+\$([\d.,]+)/i);
   if (m) {
     const origen = m[1].trim();

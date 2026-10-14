@@ -124,8 +124,6 @@ export async function appendMovimiento(env, mov) {
   return fila;
 }
 
-// ---------- OPTIMIZACIONES C.6 ----------
-
 export async function obtenerProximaFila(env) {
   return obtenerSiguienteFila(env);
 }
@@ -162,9 +160,6 @@ export async function appendMovimientosBatch(env, movs) {
   return filas;
 }
 
-// ---------- BÚSQUEDA POR ID ----------
-
-// Busca la fila física dado un ID (columna A)
 export async function buscarFilaPorId(env, idBuscado) {
   const data = await sheetsRequest(
     env,
@@ -180,14 +175,6 @@ export async function buscarFilaPorId(env, idBuscado) {
   }
   return null;
 }
-
-// Devuelve el ID (columna A) de una fila física
-export async function obtenerIdDeFila(env, fila) {
-  const r = await leerMovimientoPorFila(env, fila);
-  return r ? String(r[0] || '').trim() : '';
-}
-
-// ---------- ACTUALIZACIONES ----------
 
 export async function actualizarRubro(env, fila, rubro) {
   return sheetsRequest(env, `/values/MOVIMIENTOS!G${fila}?valueInputOption=USER_ENTERED`, {
@@ -328,9 +315,6 @@ export async function leerPresupuestoMes(env, año, mesNum) {
   return resultado;
 }
 
-// ---------- C.5: ESCRIBIR PRESUPUESTO ----------
-
-// Guarda o actualiza un rubro del presupuesto para un mes específico
 export async function guardarPresupuesto(env, año, mesNum, rubro, monto) {
   const data = await sheetsRequest(
     env,
@@ -353,7 +337,6 @@ export async function guardarPresupuesto(env, año, mesNum, rubro, monto) {
     });
     return filaExistente;
   }
-  // Nueva fila
   const fila = rows.length + 1;
   await sheetsRequest(env, `/values/PRESUPUESTO!A${fila}:D${fila}?valueInputOption=USER_ENTERED`, {
     method: 'PUT',
@@ -454,8 +437,6 @@ export async function limpiarBorradoresViejos(env) {
   return { borradas, msgs };
 }
 
-// ---------- APRENDIZAJE ----------
-
 export async function leerAprendizaje(env) {
   try {
     const data = await sheetsRequest(
@@ -549,8 +530,6 @@ export async function reemplazarAprendizaje(env, datos) {
   }
 }
 
-// ---------- C.6: IDs de correos ----------
-
 export async function leerIdsCorreosExistentes(env) {
   const data = await sheetsRequest(
     env,
@@ -572,9 +551,8 @@ export async function actualizarIdCorreo(env, fila, idCorreo) {
   });
 }
 
-// ---------- C.4: ALERTAS ----------
+// ---------- ALERTAS ----------
 
-// Devuelve un Set con las alertas ya enviadas este mes: "YYYY-MM:Rubro:Umbral"
 export async function leerAlertasEnviadas(env, mes) {
   try {
     const data = await sheetsRequest(
@@ -604,4 +582,85 @@ export async function guardarAlerta(env, mes, rubro, umbral) {
     method: 'PUT',
     body: JSON.stringify({ values: [[mes, rubro, umbral, fecha]] }),
   });
+}
+
+// ---------- SALDOS ----------
+
+export async function leerSaldos(env) {
+  try {
+    const data = await sheetsRequest(
+      env,
+      `/values/SALDOS!A:E?valueRenderOption=FORMATTED_VALUE`
+    );
+    const rows = data.values || [];
+    const resultado = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r[0]) continue;
+      resultado.push({
+        fila: i + 1,
+        mes: String(r[0]).trim(),
+        ingresos: Number(String(r[1] || '0').replace(/[.,]/g, '')) || 0,
+        gastos: Number(String(r[2] || '0').replace(/[.,]/g, '')) || 0,
+        balance: Number(String(r[3] || '0').replace(/[.,]/g, '')) || 0,
+        acumulado: Number(String(r[4] || '0').replace(/[.,]/g, '')) || 0,
+      });
+    }
+    return resultado;
+  } catch (e) {
+    if (String(e.message).includes('Unable to parse range')) return [];
+    throw e;
+  }
+}
+
+export async function guardarSaldoMes(env, mesKey, ingresos, gastos, balance, acumulado) {
+  const existentes = await leerSaldos(env);
+  const existente = existentes.find(s => s.mes === mesKey);
+
+  if (existente) {
+    await sheetsRequest(
+      env,
+      `/values/SALDOS!B${existente.fila}:E${existente.fila}?valueInputOption=USER_ENTERED`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ values: [[ingresos, gastos, balance, acumulado]] }),
+      }
+    );
+    return existente.fila;
+  }
+
+  const data = await sheetsRequest(env, `/values/SALDOS!A:E`);
+  const fila = (data.values || []).length + 1;
+  await sheetsRequest(
+    env,
+    `/values/SALDOS!A${fila}:E${fila}?valueInputOption=USER_ENTERED`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ values: [[mesKey, ingresos, gastos, balance, acumulado]] }),
+    }
+  );
+  return fila;
+}
+
+export async function leerSueldoBase(env) {
+  try {
+    const data = await sheetsRequest(
+      env,
+      `/values/CONFIG!A:B?valueRenderOption=FORMATTED_VALUE`
+    );
+    const rows = data.values || [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r[0]) continue;
+      if (String(r[0]).toLowerCase().includes('neto que te consignan')) {
+        const montoStr = String(r[1]).replace(/[$,.\s]/g, '');
+        const monto = Number(montoStr);
+        if (!isNaN(monto) && monto > 0) return monto;
+      }
+    }
+    return 0;
+  } catch (e) {
+    console.log('[CONFIG] Error leyendo sueldo:', e.message);
+    return 0;
+  }
 }
