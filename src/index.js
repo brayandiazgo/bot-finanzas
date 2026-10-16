@@ -24,7 +24,8 @@ import {
   buscarFilaPorId,
   leerAlertasEnviadas, guardarAlerta,
   guardarPresupuesto,
-  leerSaldos, guardarSaldoMes, leerSueldoBase,
+  leerSaldos, guardarSaldoMes, leerSueldoBase, reemplazarSaldos,
+  leerConfig,
 } from './sheets.js';
 import {
   contarCorreosBancolombia, listarCorreosBancolombia, leerCorreo, verPrimerCorreo,
@@ -371,6 +372,37 @@ async function calcularSaldosHistoricos(env) {
     const añoActual = Number(hoy.slice(0, 4));
     const mesActual = Number(hoy.slice(5, 7));
 
+    // --- Leer saldo inicial desde CONFIG ---
+    let saldoInicial = 0;
+    try {
+      const config = await leerConfig(env);
+      console.log('[SALDOS] CONFIG completo:', JSON.stringify(config));
+
+      for (const fila of config) {
+        if (!fila || !fila[0]) continue;
+        const etiqueta = String(fila[0]).toLowerCase();
+        if (etiqueta.includes('saldo') && etiqueta.includes('inicial')) {
+          const limpio = String(fila[1] || '0').replace(/[^\d]/g, '');
+          const monto = Number(limpio);
+          if (!isNaN(monto) && monto > 0) {
+            saldoInicial = monto;
+            console.log('[SALDOS] ✅ Saldo inicial:', saldoInicial);
+            break;
+          }
+        }
+      }
+      if (saldoInicial === 0) {
+        console.log('[SALDOS] ⚠️ NO se encontró saldo inicial, usando 0');
+      }
+    } catch (e) {
+      console.log('[SALDOS] ❌ Error leyendo CONFIG:', e.message);
+    }
+
+    console.log('[SALDOS] Arrancando acumulado en:', saldoInicial);
+
+    const filasNuevas = [];
+    let acumulado = saldoInicial;
+
     for (let m = 1; m <= mesActual; m++) {
       const mesKey = `${añoActual}-${String(m).padStart(2, '0')}`;
       const mesIni = `${mesKey}-01`;
@@ -379,10 +411,10 @@ async function calcularSaldosHistoricos(env) {
       const finEfectivo = mesFin > hoy ? hoy : mesFin;
 
       const rows = await leerMovimientos(env, mesIni, finEfectivo, true);
-      
+
       let ingresos = 0;
       let gastos = 0;
-      
+
       for (const { data: r } of rows) {
         const tipo = r[10];
         const valor = parsearValor(r[7]);
@@ -392,22 +424,18 @@ async function calcularSaldosHistoricos(env) {
           gastos += Math.abs(valor);
         }
       }
-      
+
       const balance = ingresos - gastos;
-      const saldosExistentes = await leerSaldos(env);
-      
-      let acumuladoAnterior = 0;
-      for (const s of saldosExistentes) {
-        if (s.mes < mesKey) acumuladoAnterior = s.acumulado;
-      }
-      const acumulado = acumuladoAnterior + balance;
-      
-      await guardarSaldoMes(env, mesKey, ingresos, gastos, balance, acumulado);
+      acumulado += balance;
+
+      filasNuevas.push([mesKey, ingresos, gastos, balance, acumulado]);
     }
-    
+
+    console.log('[SALDOS] Filas finales:', JSON.stringify(filasNuevas));
+    await reemplazarSaldos(env, filasNuevas);
     return true;
   } catch (e) {
-    console.log('[SALDOS] Error calculando históricos:', e.message);
+    console.log('[SALDOS] ❌ Error general:', e.message, e.stack);
     return false;
   }
 }
@@ -474,7 +502,11 @@ async function calcularResumen(env) {
   }
 
   const presupuesto = await leerPresupuestoMes(env, año, mesNum);
-  const totalPresupuesto = presupuesto.reduce((a, p) => a + p.monto, 0);
+  const totalPresupuestoOriginal = presupuesto.reduce((a, p) => a + p.monto, 0);
+
+  // Usar el sueldo real como base de comparación (no el total del plan)
+  const sueldoBase = await leerSueldoBase(env);
+  const totalPresupuesto = sueldoBase > 0 ? sueldoBase : totalPresupuestoOriginal;
 
   const rubrosConDatos = [];
   for (const p of presupuesto) {
@@ -498,6 +530,7 @@ async function calcularResumen(env) {
     diaHoy, diasRestantes, mesNum,
     totalPresupuesto, totalGastadoAbs, totalDisponible, pctTotal,
     topAjustados,
+    acumulado: (await obtenerSaldoActual(env)).acumulado,
   };
 }
 
@@ -516,8 +549,9 @@ function mensajeResumen(data) {
   msg += `📅 Quedan <b>${data.diasRestantes}</b> días de ${mesNombre}\n\n`;
 
   if (data.totalPresupuesto > 0) {
-    msg += `💰 <b>Disponible:</b> $${fmt(data.totalDisponible)}\n`;
-    msg += `   (has usado ${data.pctTotal.toFixed(0)}% del presupuesto)\n\n`;
+    msg += `💰 <b>Disponible en cuenta:</b> $${fmt(data.acumulado)}\n\n`;
+    msg += `📊 Presupuesto: $${fmt(data.totalGastadoAbs)} / $${fmt(data.totalPresupuesto)} (${data.pctTotal.toFixed(0)}%)\n`;
+    msg += `   <i>Plan mensual asignado: $${fmt(data.totalPresupuestoOriginal)}</i>\n\n`;
   }
 
   if (data.topAjustados.length > 0) {
@@ -659,18 +693,17 @@ async function handleSaldo(env, chatId) {
   if (data.ingresosExtra > 0) {
     msg += `📥 Ingresos extra:    $${fmt(data.ingresosExtra)}\n`;
   }
-  msg += `💸 Gastos:            $${fmt(data.gastos)}\n`;
+  msg += `💸 Gastos del mes:    $${fmt(data.gastos)}\n`;
   msg += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  
+
   const signo = data.balance >= 0 ? '+' : '';
   const icono = data.balance >= 0 ? '📈' : '📉';
   msg += `${icono} Balance del mes:   ${signo}$${fmt(data.balance)}\n\n`;
-  
-  msg += `💰 Disponible real:   $${fmt(data.disponible)}\n`;
+
+  msg += `💰 <b>Disponible real:   $${fmt(data.acumulado)}</b>\n`;
   const signoAcum = data.acumulado >= 0 ? '+' : '';
-  const iconoAcum = data.acumulado >= 0 ? '🏦' : '⚠️';
-  msg += `${iconoAcum} Saldo acumulado:   ${signoAcum}$${fmt(data.acumulado)}\n`;
-  
+  msg += `🏦 Saldo acumulado:   ${signoAcum}$${fmt(data.acumulado)}\n`;
+
   return enviar(env, chatId, msg);
 }
 
@@ -1494,9 +1527,11 @@ async function handleCorreos(env, chatId, silencioso = false) {
     }
 
     const nominas = candidatos.filter(c => c.esNomina);
-    const pendientes = candidatos.filter(c => !c.esNomina);
+    const otrosIngresos = candidatos.filter(c => c.esIngreso && !c.esNomina);
+    const gastos = candidatos.filter(c => !c.esIngreso);
     const movsBatch = [];
 
+    // Nómina → Salario (confirmado directo)
     for (const n of nominas) {
       movsBatch.push({
         fecha: n.fecha || hoyColombia(),
@@ -1511,7 +1546,22 @@ async function handleCorreos(env, chatId, silencioso = false) {
       });
     }
 
-    for (const c of pendientes) {
+    // Otros ingresos → Ingreso extra (BORRADOR — requiere confirmación)
+    for (const o of otrosIngresos) {
+      movsBatch.push({
+        fecha: o.fecha || hoyColombia(),
+        rubro: 'Ingreso extra',
+        valor: o.monto,
+        descripcion: o.descripcion,
+        medio: o.medio || 'Transferencia',
+        tipo: 'Ingreso',
+        fuente: 'correo',
+        estado: 'pendiente',
+        id_correo: o.id,
+      });
+    }
+
+    for (const c of gastos) {
       const { rubro } = categorizarConCache(c.descripcion);
       movsBatch.push({
         fecha: c.fecha || hoyColombia(),
@@ -1529,15 +1579,16 @@ async function handleCorreos(env, chatId, silencioso = false) {
     const filas = await appendMovimientosBatch(env, movsBatch);
 
     const borradoresInfo = [];
-    for (let i = 0; i < pendientes.length; i++) {
-      const c = pendientes[i];
+    const todosBorradores = [...otrosIngresos, ...gastos];
+    for (let i = 0; i < todosBorradores.length; i++) {
+      const c = todosBorradores[i];
       const fila = filas[nominas.length + i];
       borradoresInfo.push({
         fila,
         id: c.id,
         descripcion: c.descripcion,
         monto: c.monto,
-        esIngreso: false,
+        esIngreso: !!c.esIngreso,
       });
     }
 
@@ -1548,10 +1599,31 @@ async function handleCorreos(env, chatId, silencioso = false) {
       msg += `💼 Registré ${nominas.length} nómina(s) automáticamente.\n\n`;
     }
     for (const b of borradoresInfo) {
-      msg += `➖ $${fmt(b.monto)} — ${b.descripcion}\n`;
+      const signo = b.esIngreso ? '➕' : '➖';
+      msg += `${signo} $${fmt(b.monto)} — ${b.descripcion}\n`;
     }
 
-    if (borradoresInfo.length > 0) {
+    if (borradoresInfo.length === 1) {
+      // Un solo borrador → mensaje individual directo
+      const b = borradoresInfo[0];
+      const r = await leerMovimientoPorFila(env, b.fila);
+      const id = String(r?.[0] || b.fila).trim();
+      const valor = parsearValor(r?.[7]);
+      const msgInd =
+        `🕒 <b>Borrador</b> (ID ${id})\n` +
+        textoBorrador(r[1], r[6], valor, r[8], r[9]) +
+        `\n\nPresiona ✅ para guardar:`;
+      const resp = await enviar(env, chatId, msgInd, {
+        reply_markup: tecladoCorreoIndividual(b.fila),
+      });
+      if (resp && resp.ok && resp.result) {
+        try { await guardarMsgId(env, b.fila, resp.result.message_id); } catch (e) { /* noop */ }
+      }
+      // Si además hubo nóminas, avisar en mensaje aparte
+      if (nominas.length > 0) {
+        await enviar(env, chatId, `💼 Registré ${nominas.length} nómina(s) automáticamente.`);
+      }
+    } else if (borradoresInfo.length > 1) {
       msg += `\nConfirma con ✅ o revisa uno por uno.`;
       await enviar(env, chatId, msg, {
         reply_markup: tecladoCorreos(borradoresInfo),
@@ -1643,6 +1715,10 @@ async function handleCorreosVerIndividual(env, chatId, messageId) {
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
+
+  if (texto.startsWith('/registrarcomandos')) return registrarComandos(env).then(r =>
+    enviar(env, chatId, r && r.ok ? '✅ Comandos registrados en Telegram.' : '❌ Error registrando.')
+  );
 
   if (String(chatId) !== String(env.TELEGRAM_CHAT_ID).trim()) {
     return enviar(env, chatId, '⛔ No autorizado.');
@@ -2045,3 +2121,42 @@ export default {
     }
   },
 };
+
+async function registrarComandos(env) {
+  const comandos = [
+    { command: 'ayuda',        description: 'Ver todos los comandos' },
+    { command: 'saldo',        description: 'Balance, sueldo y acumulado' },
+    { command: 'resumen',      description: 'Resumen del día' },
+    { command: 'mes',          description: 'Resumen por rubro del mes' },
+    { command: 'rubro',        description: 'Detalle de un rubro' },
+    { command: 'metodos',      description: 'Desglose por medio de pago' },
+    { command: 'tendencia',    description: 'Últimos 4 meses' },
+    { command: 'hoy',          description: 'Movimientos de hoy' },
+    { command: 'semana',       description: 'Últimos 7 días' },
+    { command: 'presupuesto',  description: 'Presupuesto del mes' },
+    { command: 'listar',       description: 'Últimos 10 movimientos' },
+    { command: 'borradores',   description: 'Borradores pendientes' },
+    { command: 'correos',      description: 'Procesar correos del banco' },
+    { command: 'sugerencia',   description: 'Análisis mensual' },
+    { command: 'editar',       description: 'Editar movimiento por ID' },
+    { command: 'borrar',       description: 'Borrar movimiento por ID' },
+    { command: 'valor',        description: 'Cambiar el monto de un movimiento' },
+    { command: 'desc',         description: 'Cambiar la descripción' },
+    { command: 'gasto',        description: 'Registrar gasto con /gasto' },
+    { command: 'revisar',      description: 'Revisar rubros "Otro"' },
+    { command: 'aprender',     description: 'Cargar aprendizaje' },
+    { command: 'aprendizaje',  description: 'Ver tabla de aprendizaje' },
+    { command: 'recalcular',   description: 'Recalcular saldos históricos' },
+    { command: 'testcorreos',  description: 'Test Gmail' },
+    { command: 'vercorreo',    description: 'Ver último correo crudo' },
+    { command: 'testparser',   description: 'Analizar últimos correos' },
+  ];
+  try {
+    const res = await tg(env, 'setMyCommands', { commands: comandos });
+    console.log('[SETMYCOMMANDS]', JSON.stringify(res));
+    return res;
+  } catch (e) {
+    console.log('[SETMYCOMMANDS] Error:', e.message);
+    return null;
+  }
+}

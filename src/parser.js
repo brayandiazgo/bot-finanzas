@@ -91,8 +91,25 @@ export function parsearCorreo(correo) {
     };
   }
 
-  // 3a. TRANSFERENCIA RECIBIDA (formato nuevo: "Recibiste una transferencia por $X de NOMBRE")
-  m = body.match(/Recibiste\s+una\s+transferencia\s+por\s+\$([\d.,]+)\s+de\s+([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]+?)\s+en\s+tu\s+cuenta/i);
+  // 3a. TRANSFERENCIA RECIBIDA (formato nuevo: "Recibiste una transferencia por $X de NOMBRE en tu cuenta")
+  m = body.match(/Recibiste\s+una\s+transferencia\s+por\s+\$([\d.,]+)\s+de\s+([A-Za-zÁÉÍÓÚÑáéíóúñ\s]+?)\s+en\s+tu\s+cuenta/i);
+    // 3a-bis. TRANSFERENCIA RECIBIDA (fallback: cualquier cosa entre "de" y "en tu cuenta")
+  m = body.match(/Recibiste\s+una\s+transferencia\s+por\s+\$([\d.,]+)\s+de\s+(.+?)\s+en\s+tu\s+cuenta/i);
+  if (m) {
+    const monto = parsearMonto(m[1]);
+    const origen = m[2].trim();
+    const fecha = parsearFecha(body);
+    return {
+      tipo: 'ingreso',
+      monto,
+      descripcion: `Transferencia de ${origen}`,
+      medio: 'Transferencia',
+      fecha,
+      esIngreso: true,
+      esNomina: false,
+      nota: `Transferencia recibida de ${origen}`,
+    };
+  }
   if (m) {
     const monto = parsearMonto(m[1]);
     const origen = m[2].trim();

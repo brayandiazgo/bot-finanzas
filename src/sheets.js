@@ -268,9 +268,17 @@ export async function leerMovimientos(env, desde, hasta, soloConfirmados = false
   );
   const rows = data.values || [];
   const resultado = [];
+  const idsVistos = new Set(); // para deduplicar
+  
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r || !r[1]) continue;
+    
+    // Deduplicar por ID (columna A)
+    const id = String(r[0] || '').trim();
+    if (id && idsVistos.has(id)) continue;
+    if (id) idsVistos.add(id);
+    
     const fecha = normalizarFecha(r[1]);
     if (fecha >= desde && fecha <= hasta) {
       if (soloConfirmados && r[12] !== 'confirmado') continue;
@@ -662,5 +670,46 @@ export async function leerSueldoBase(env) {
   } catch (e) {
     console.log('[CONFIG] Error leyendo sueldo:', e.message);
     return 0;
+  }
+}
+// Borra todas las filas de SALDOS y las reemplaza por las nuevas
+export async function reemplazarSaldos(env, filas) {
+  const meta = await sheetsRequest(env, `?fields=sheets.properties`);
+  const sheet = meta.sheets.find(s => s.properties.title === 'SALDOS');
+  if (!sheet) throw new Error('No existe hoja SALDOS');
+  const sheetId = sheet.properties.sheetId;
+
+  const existentes = await sheetsRequest(env, `/values/SALDOS!A:E`);
+  const totalFilas = (existentes.values || []).length;
+  
+  // Borrar todas las filas excepto el encabezado
+  if (totalFilas > 1) {
+    await sheetsRequest(env, `:batchUpdate`, {
+      method: 'POST',
+      body: JSON.stringify({
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: 'ROWS',
+              startIndex: 1,
+              endIndex: totalFilas,
+            },
+          },
+        }],
+      }),
+    });
+  }
+
+  // Escribir las nuevas
+  if (filas.length > 0) {
+    await sheetsRequest(
+      env,
+      `/values/SALDOS!A2:E${filas.length + 1}?valueInputOption=USER_ENTERED`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ values: filas }),
+      }
+    );
   }
 }
