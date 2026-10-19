@@ -8,6 +8,7 @@ import {
   tecladoRevisar,
   tecladoCorreos, tecladoCorreoIndividual,
   tecladoAplicarPresupuesto,
+  tecladoListarBotones,
 } from './telegram.js';
 import {
   appendMovimiento, appendMovimientosBatch, obtenerProximaFila,
@@ -30,9 +31,7 @@ import {
 import {
   contarCorreosBancolombia, listarCorreosBancolombia, leerCorreo, verPrimerCorreo,
 } from './gmail.js';
-import {
-  updateYaProcesado, marcarUpdateProcesado,
-} from './kv.js';
+import { updateYaProcesado, marcarUpdateProcesado, obtenerSaldoCache, guardarSaldoCache, borrarSaldoCache } from './kv.js';
 import { parsearCorreo } from './parser.js';
 
 const TOPE_VALOR = 1000000;
@@ -303,6 +302,45 @@ async function verificarAlertas(env, chatId, rubroTocado = null) {
     console.log('[ALERTAS] Error:', e.message);
   }
 }
+// ---------- ANÁLISIS RECURRENTE ----------
+
+async function handleRecurrentes(env, chatId) {
+  const hoy = hoyColombia();
+  const hace4m = new Date();
+  hace4m.setMonth(hace4m.getMonth() - 4);
+  const desde = hace4m.toISOString().slice(0, 10);
+
+  const rows = await leerMovimientos(env, desde, hoy, true);
+  const agrupados = {};
+
+  for (const { data: r } of rows) {
+    if (r[10] !== 'Gasto') continue;
+    const descNorm = normalizar(r[8] || '');
+    if (!descNorm) continue;
+    
+    if (!agrupados[descNorm]) agrupados[descNorm] = { desc: r[8], total: 0, meses: new Set(), veces: 0 };
+    agrupados[descNorm].total += Math.abs(parsearValor(r[7]));
+    agrupados[descNorm].veces++;
+    agrupados[descNorm].meses.add(r[1].slice(0, 7)); // YYYY-MM
+  }
+
+  // Filtrar los que se repiten en al menos 3 meses distintos
+  const recurrentes = Object.values(agrupados)
+    .filter(a => a.meses.size >= 3)
+    .sort((a, b) => b.total - a.total);
+
+  if (recurrentes.length === 0) {
+    return enviar(env, chatId, `📭 No encontré gastos recurrentes suficientes (mínimo 3 meses).`);
+  }
+
+  let msg = `🔄 <b>Gastos Recurrentes</b> (últimos 4 meses)\n\n`;
+  for (const rec of recurrentes) {
+    const promedio = rec.total / rec.meses.size;
+    msg += `• <b>${rec.desc}</b> (${rec.veces}x)\n`;
+    msg += `  Promedio: $${fmt(promedio)}/mes\n`;
+  }
+  return enviar(env, chatId, msg);
+}
 
 // ---------- ANÁLISIS MENSUAL ----------
 
@@ -349,7 +387,12 @@ async function calcularSugerenciaMensual(env) {
   }
 
   sugerencia.sort((a, b) => b.promedio - a.promedio);
-  return { añoProx, mesProx, sugerencia };
+  
+  const totalSugerido = sugerencia.reduce((a, s) => a + s.promedio, 0);
+  const sueldoBase = await leerSueldoBase(env);
+  const deficit = totalSugerido - sueldoBase;
+
+  return { añoProx, mesProx, sugerencia, totalSugerido, sueldoBase, deficit };
 }
 
 function mensajeSugerencia(data) {
@@ -360,7 +403,13 @@ function mensajeSugerencia(data) {
   for (const s of data.sugerencia) {
     msg += `• ${s.rubro}: $${fmt(s.promedio)}\n`;
   }
-  msg += `\n<b>Total: $${fmt(total)}</b>`;
+  msg += `\n<b>Total: $${fmt(total)}</b>\n`;
+  
+  if (data.deficit > 0) {
+    msg += `\n⚠️ <b>Atención:</b> Estás presupuestando $${fmt(data.deficit)} más de tu sueldo base ($${fmt(data.sueldoBase)}).\nAjusta los rubros para no arrancar en déficit.`;
+  } else if (data.deficit <= 0) {
+    msg += `\n✅ <b>Bien:</b> Te quedan $${fmt(Math.abs(data.deficit))} de margen bajo tu sueldo base.`;
+  }
   return msg;
 }
 
@@ -441,6 +490,11 @@ async function calcularSaldosHistoricos(env) {
 }
 
 async function obtenerSaldoActual(env) {
+  // 1. Intentar leer caché
+  const cached = await obtenerSaldoCache(env);
+  if (cached) return cached;
+
+  // 2. Si no hay caché, recalcular todo
   await calcularSaldosHistoricos(env);
   
   const hoy = hoyColombia();
@@ -450,30 +504,19 @@ async function obtenerSaldoActual(env) {
   const saldos = await leerSaldos(env);
   const actual = saldos.find(s => s.mes === mesKey);
   
-  if (!actual) {
-    return {
-      sueldoBase,
-      ingresos: 0,
-      ingresosExtra: 0,
-      gastos: 0,
-      balance: 0,
-      disponible: 0,
-      acumulado: 0,
-    };
-  }
-  
-  const ingresosExtra = Math.max(0, actual.ingresos - sueldoBase);
-  const disponible = actual.balance;
-  
-  return {
+  const result = {
     sueldoBase,
-    ingresos: actual.ingresos,
-    ingresosExtra,
-    gastos: actual.gastos,
-    balance: actual.balance,
-    disponible,
-    acumulado: actual.acumulado,
+    ingresos: actual ? actual.ingresos : 0,
+    gastos: actual ? actual.gastos : 0,
+    balance: actual ? actual.balance : 0,
+    disponible: actual ? actual.balance : 0,
+    acumulado: actual ? actual.acumulado : 0,
+    ingresosExtra: actual ? Math.max(0, actual.ingresos - sueldoBase) : 0,
   };
+  
+  // 3. Guardar en caché
+  await guardarSaldoCache(env, result);
+  return result;
 }
 
 // ---------- CÁLCULO DE RESUMEN ----------
@@ -530,6 +573,7 @@ async function calcularResumen(env) {
     diaHoy, diasRestantes, mesNum,
     totalPresupuesto, totalGastadoAbs, totalDisponible, pctTotal,
     topAjustados,
+    totalPresupuestoOriginal,
     acumulado: (await obtenerSaldoActual(env)).acumulado,
   };
 }
@@ -593,6 +637,9 @@ async function handleStart(env, chatId) {
     `/hoy — movimientos de hoy\n` +
     `/semana — últimos 7 días\n` +
     `/presupuesto — presupuesto del mes\n` +
+    `/buscar texto — buscar en el historial\n` +
+    `/recurrentes — ver gastos que se repiten\n` +
+    `/grafico — gráfico de gastos del mes\n` +
     `/listar — últimos 10 movimientos\n` +
     `/borradores — borradores pendientes\n\n` +
     `<b>Correos:</b>\n` +
@@ -678,6 +725,47 @@ async function handleRegistrar(env, chatId, monto, desc, medio) {
   }
 
   return msgResp;
+}
+
+async function handleReporteSemanal(env, chatId) {
+  const hoy = hoyColombia();
+  const hace7 = new Date();
+  hace7.setDate(hace7.getDate() - 7);
+  const desde = new Date(hace7.toLocaleString('en-US', { timeZone: 'America/Bogota' })).toISOString().slice(0, 10);
+
+  const rows = await leerMovimientos(env, desde, hoy, true);
+  if (rows.length === 0) return enviar(env, chatId, '📭 Sin movimientos esta semana.');
+
+  let gastos = 0, ingresos = 0;
+  const porRubro = {};
+  
+  for (const { data: r } of rows) {
+    const tipo = r[10];
+    const valor = parsearValor(r[7]);
+    if (tipo === 'Gasto') {
+      gastos += valor;
+      const rubro = r[6] || 'Otro';
+      porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(valor);
+    } else if (tipo === 'Ingreso') {
+      ingresos += valor;
+    }
+  }
+
+  const topRubros = Object.entries(porRubro).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  let msg = `📅 <b>Reporte Semanal</b>\n`;
+  msg += `(${desde} al ${hoy})\n\n`;
+  msg += `📥 Ingresos: $${fmt(ingresos)}\n`;
+  msg += `💸 Gastos: $${fmt(Math.abs(gastos))}\n`;
+  msg += `⚖️ Balance: $${fmt(ingresos + gastos)}\n\n`;
+  
+  if (topRubros.length > 0) {
+    msg += `🔥 <b>Top 3 en lo que más gastaste:</b>\n`;
+    for (const [rubro, monto] of topRubros) {
+      msg += `• ${rubro}: $${fmt(monto)}\n`;
+    }
+  }
+  return enviar(env, chatId, msg);
 }
 
 async function handleSaldo(env, chatId) {
@@ -1069,17 +1157,9 @@ async function handleListar(env, chatId, offset = 0, messageId = null) {
   if (total === 0) return enviar(env, chatId, '📭 No hay movimientos confirmados.');
 
   let msg = `📋 <b>Movimientos recientes</b> (${offset + 1}-${Math.min(offset + 10, total)} de ${total})\n\n`;
-  for (const { data: r } of items) {
-    const valor = parsearValor(r[7]);
-    const signo = valor < 0 ? '➖' : '➕';
-    const fecha = normalizarFecha(r[1]);
-    const medio = r[9] || 'Efectivo';
-    const id = String(r[0] || '').trim();
-    msg += `<b>#${id}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6] || 'Otro'}, ${medio})</i>\n`;
-  }
-  msg += `\nUsa /editar ID o /borrar ID para modificar un movimiento.`;
+  msg += `<i>Toca un movimiento para editarlo:</i>`;
 
-  const teclado = tecladoListado(offset, total);
+  const teclado = tecladoListarBotones(items, offset, total);
 
   if (messageId) {
     return editarMensaje(env, chatId, messageId, msg, { reply_markup: teclado });
@@ -1101,6 +1181,43 @@ async function handleBorradores(env, chatId) {
   msg += `\n✅ Guardar · ✏️ Editar · 🗑️ Descartar`;
 
   return enviar(env, chatId, msg, { reply_markup: tecladoBorradores(borradores) });
+}
+
+async function handleBuscar(env, chatId, busqueda) {
+  if (!busqueda) {
+    return enviar(env, chatId, `❌ Uso: <code>/buscar rappi</code>`);
+  }
+  const hoy = hoyColombia();
+  const rows = await leerMovimientos(env, '2000-01-01', hoy, true); // busca en todo el historial
+  const query = busqueda.toLowerCase().trim();
+  
+  const encontrados = [];
+  for (const { fila, data: r } of rows) {
+    const desc = String(r[8] || '').toLowerCase();
+    const rubro = String(r[6] || '').toLowerCase();
+    if (desc.includes(query) || rubro.includes(query)) {
+      encontrados.push({ fila, data: r });
+    }
+  }
+
+  if (encontrados.length === 0) {
+    return enviar(env, chatId, `🔍 No encontré movimientos con "${busqueda}".`);
+  }
+
+  let msg = `🔍 <b>Resultados para "${busqueda}"</b> (${encontrados.length})\n\n`;
+  // Mostrar los últimos 15
+  const recientes = encontrados.slice(-15).reverse();
+  for (const { data: r } of recientes) {
+    const valor = parsearValor(r[7]);
+    const signo = valor < 0 ? '➖' : '➕';
+    const fecha = normalizarFecha(r[1]);
+    const id = String(r[0] || '').trim();
+    msg += `<b>#${id}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6]})</i>\n`;
+  }
+  if (encontrados.length > 15) {
+    msg += `\n<i>... y ${encontrados.length - 15} más.</i>`;
+  }
+  return enviar(env, chatId, msg);
 }
 
 async function handleEditar(env, chatId, idBuscado) {
@@ -1710,12 +1827,56 @@ async function handleCorreosVerIndividual(env, chatId, messageId) {
   }
 }
 
+// ---------- Gráficos con QuickChart ----------
+
+async function handleGrafico(env, chatId) {
+  const hoy = hoyColombia();
+  const año = Number(hoy.slice(0, 4));
+  const mesNum = Number(hoy.slice(5, 7));
+  const mesIni = hoy.slice(0, 7) + '-01';
+
+  const rows = await leerMovimientos(env, mesIni, hoy, true);
+  const porRubro = {};
+  for (const { data: r } of rows) {
+    if (r[10] !== 'Gasto') continue;
+    const rubro = r[6] || 'Otro';
+    porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(parsearValor(r[7]));
+  }
+
+  const datos = Object.entries(porRubro).sort((a, b) => b[1] - a[1]).slice(0, 6); // Top 6
+  if (datos.length === 0) return enviar(env, chatId, `📭 No hay gastos este mes.`);
+
+  const labels = datos.map(d => d[0]);
+  const values = datos.map(d => d[1]);
+
+  const chartConfig = {
+    type: 'doughnut',
+    data: {
+      labels: labels,
+      datasets: [{ data: values }]
+    },
+    options: {
+      plugins: { legend: { position: 'bottom' } }
+    }
+  };
+
+  const url = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=600&h=400&bkg=white`;
+  
+  // Enviar como foto a Telegram
+  return tg(env, 'sendPhoto', {
+    chat_id: chatId,
+    photo: url,
+    caption: `📊 <b>Gastos de ${MESES[mesNum - 1]} por rubro</b>`,
+    parse_mode: 'HTML'
+  });
+}
+
 // ---------- MANEJO DE MENSAJES ----------
 
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
-
+  if (texto.startsWith('/recurrentes')) return handleRecurrentes(env, chatId);
   if (texto.startsWith('/registrarcomandos')) return registrarComandos(env).then(r =>
     enviar(env, chatId, r && r.ok ? '✅ Comandos registrados en Telegram.' : '❌ Error registrando.')
   );
@@ -1799,6 +1960,11 @@ async function handleMensaje(env, msg) {
     }
   }
 
+  if (texto.startsWith('/buscar')) {
+    const resto = texto.replace('/buscar', '').trim();
+    return handleBuscar(env, chatId, resto);
+  }
+  if (texto.startsWith('/grafico')) return handleGrafico(env, chatId);  
   return enviar(env, chatId, '🤖 No entendí. Usa /ayuda o escribe "5000 almuerzo".');
 }
 
@@ -1808,6 +1974,28 @@ async function handleCallback(env, cq) {
   const data = cq.data || '';
   const [accion, ...params] = data.split(':');
 
+  if (accion === 'editar_lista') {
+    const fila = Number(params[0]);
+    try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
+    
+    const r = await leerMovimientoPorFila(env, fila);
+    if (!r) return enviar(env, chatId, `❌ No encontré el movimiento.`);
+    const idBuscado = String(r[0] || fila).trim();
+    
+    await actualizarEstado(env, fila, 'pendiente');
+    await borrarMensajesDeBorradoresViejos(env, chatId);
+
+    const msgResp = await enviar(env, chatId,
+      `✏️ <b>Editando #${idBuscado}</b>\n\n` +
+      textoBorrador(r[1], r[6], parsearValor(r[7]), r[8], r[9]),
+      { reply_markup: tecladoBorradorEdicion(fila) }
+    );
+
+    if (msgResp && msgResp.ok && msgResp.result) {
+      try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
+    }
+    return;
+  }
   if (accion === 'ok') {
     const fila = Number(params[0]);
     const rAntes = await leerMovimientoPorFila(env, fila);
@@ -1841,6 +2029,8 @@ async function handleCallback(env, cq) {
   if (accion === 'cancelar') {
     const fila = Number(params[0]);
     try { await borrarFila(env, fila); } catch (e) { /* noop */ }
+    await actualizarEstado(env, fila, 'confirmado');
+    await borrarSaldoCache(env); //
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Cancelado`);
   }
@@ -1848,6 +2038,8 @@ async function handleCallback(env, cq) {
   if (accion === 'eliminar') {
     const fila = Number(params[0]);
     try { await borrarFila(env, fila); } catch (e) { /* noop */ }
+    await actualizarEstado(env, fila, 'confirmado');
+    await borrarSaldoCache(env); // 
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Eliminado`);
   }
@@ -1954,6 +2146,8 @@ async function handleCallback(env, cq) {
   if (accion === 'confirmar_borrar') {
     const fila = Number(params[0]);
     try { await borrarFila(env, fila); } catch (e) { /* noop */ }
+    await actualizarEstado(env, fila, 'confirmado');
+    await borrarSaldoCache(env); // 
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Eliminado`);
   }
@@ -1995,11 +2189,17 @@ async function handleCallback(env, cq) {
   }
 
   if (accion === 'correos_confirmar_todos') {
+    await actualizarEstado(env, fila, 'confirmado');
+    await borrarSaldoCache(env); // 
     return handleCorreosConfirmarTodos(env, chatId, messageId);
+ 
   }
 
   if (accion === 'correos_ignorar_todos') {
+    await actualizarEstado(env, fila, 'confirmado');
+    await borrarSaldoCache(env); // 
     return handleCorreosIgnorarTodos(env, chatId, messageId);
+    
   }
 
   if (accion === 'correos_ver_individual') {
@@ -2085,8 +2285,16 @@ export default {
         const chatId = env.TELEGRAM_CHAT_ID;
         const data = await calcularResumen(env);
         if (data.totalPresupuesto > 0) {
-          await enviar(env, chatId, mensajeResumen(data));
+        await enviar(env, chatId, mensajeResumen(data));
         }
+        // Si es lunes en Colombia, mandar también el reporte semanal
+        const diaSemana = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' })).getDay();
+        if (diaSemana === 1) { // 1 = lunes
+        await handleReporteSemanal(env, chatId);
+        }
+      } else if (event.cron === '0 1 * * 1') { // Lunes 1:00 AM UTC = Domingo 8:00 PM Colombia
+        await handleReporteSemanal(env, env.TELEGRAM_CHAT_ID);
+      } else if (event.cron === '*/30 * * * *') {
       } else if (event.cron === '0 23 * * *') {
         const chatId = env.TELEGRAM_CHAT_ID;
         await handleCorreos(env, chatId, true);
@@ -2150,6 +2358,9 @@ async function registrarComandos(env) {
     { command: 'testcorreos',  description: 'Test Gmail' },
     { command: 'vercorreo',    description: 'Ver último correo crudo' },
     { command: 'testparser',   description: 'Analizar últimos correos' },
+    { command: 'buscar',       description: 'Buscar en el historial' },
+    { command: 'recurrentes',  description: 'Ver gastos recurrentes' },
+    { command: 'grafico',      description: 'Gráfico del mes' },
   ];
   try {
     const res = await tg(env, 'setMyCommands', { commands: comandos });

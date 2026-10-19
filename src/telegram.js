@@ -200,3 +200,17 @@ export function tecladoAplicarPresupuesto(año, mesNum) {
     ]],
   };
 }
+export function tecladoListarBotones(items, offset, total) {
+  const filas = [];
+  for (const b of items) {
+    const valor = Math.abs(Number(String(b.data[7] || '0').replace(/[.,]/g, '')));
+    const id = String(b.data[0] || b.fila).trim();
+    filas.push([{ text: `✏️ #${id} · $${Math.round(valor).toLocaleString('es-CO')}`, callback_data: `editar_lista:${b.fila}` }]);
+  }
+  const nav = [];
+  if (offset > 0) nav.push({ text: '⬅️ Anteriores', callback_data: `listar:${Math.max(0, offset - 10)}` });
+  if (offset + 10 < total) nav.push({ text: '➡️ Siguientes', callback_data: `listar:${offset + 10}` });
+  if (nav.length > 0) filas.push(nav);
+  filas.push([{ text: '✖️ Cerrar', callback_data: 'listar_cerrar' }]);
+  return { inline_keyboard: filas };
+}

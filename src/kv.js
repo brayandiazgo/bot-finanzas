@@ -23,3 +23,31 @@ export async function marcarUpdateProcesado(env, updateId) {
     console.log('[KV] Error guardando update:', e.message);
   }
 }
+const SALDO_CACHE_KEY = 'saldo_acumulado_cache';
+
+export async function obtenerSaldoCache(env) {
+  try {
+    const cached = await env.BOT_KV.get(SALDO_CACHE_KEY);
+    if (!cached) return null;
+    return JSON.parse(cached);
+  } catch (e) {
+    console.log('[KV] Error leyendo caché saldo:', e.message);
+    return null;
+  }
+}
+
+export async function guardarSaldoCache(env, data) {
+  try {
+    await env.BOT_KV.put(SALDO_CACHE_KEY, JSON.stringify(data), { expirationTtl: 3600 }); // 1 hora
+  } catch (e) {
+    console.log('[KV] Error guardando caché saldo:', e.message);
+  }
+}
+
+export async function borrarSaldoCache(env) {
+  try {
+    await env.BOT_KV.delete(SALDO_CACHE_KEY);
+  } catch (e) {
+    console.log('[KV] Error borrando caché saldo:', e.message);
+  }
+}
