@@ -214,3 +214,27 @@ export function tecladoListarBotones(items, offset, total) {
   filas.push([{ text: '✖️ Cerrar', callback_data: 'listar_cerrar' }]);
   return { inline_keyboard: filas };
 }
+
+// ---------- Paginación en /buscar ----------
+
+export function tecladoBuscar(offset, total, query) {
+  const filas = [];
+  const nav = [];
+  if (offset > 0) nav.push({ text: '⬅️ Anteriores', callback_data: `buscar_pag:${query}:${Math.max(0, offset - 10)}` });
+  if (offset + 10 < total) nav.push({ text: '➡️ Siguientes', callback_data: `buscar_pag:${query}:${offset + 10}` });
+  if (nav.length > 0) filas.push(nav);
+  filas.push([{ text: '✖️ Cerrar', callback_data: 'listar_cerrar' }]);
+  return { inline_keyboard: filas };
+}
+
+export function tecladoMenuPrincipal() {
+  return {
+    keyboard: [
+      [{ text: '💰 Saldo' }, { text: '📊 Resumen' }],
+      [{ text: '📅 Hoy' }, { text: '📈 Gráfico' }],
+      [{ text: '📝 Borradores' }, { text: '📧 Correos' }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true // <-- OJO: Es is_persistent, no persistent
+  };
+}

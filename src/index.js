@@ -9,6 +9,8 @@ import {
   tecladoCorreos, tecladoCorreoIndividual,
   tecladoAplicarPresupuesto,
   tecladoListarBotones,
+  tecladoBuscar,
+  tecladoMenuPrincipal // <-- Asegúrate de que esté aquí
 } from './telegram.js';
 import {
   appendMovimiento, appendMovimientosBatch, obtenerProximaFila,
@@ -315,13 +317,20 @@ async function handleRecurrentes(env, chatId) {
 
   for (const { data: r } of rows) {
     if (r[10] !== 'Gasto') continue;
-    const descNorm = normalizar(r[8] || '');
-    if (!descNorm) continue;
+    const descOriginal = r[8] || '';
+    if (!descOriginal) continue;
+
+    // Agrupamos por la primera palabra (ej: "Netflix", "Rappi", "Didi")
+    const palabraClave = primeraPalabra(descOriginal);
+    if (!palabraClave || palabraClave.length < 3) continue;
     
-    if (!agrupados[descNorm]) agrupados[descNorm] = { desc: r[8], total: 0, meses: new Set(), veces: 0 };
-    agrupados[descNorm].total += Math.abs(parsearValor(r[7]));
-    agrupados[descNorm].veces++;
-    agrupados[descNorm].meses.add(r[1].slice(0, 7)); // YYYY-MM
+    if (!agrupados[palabraClave]) {
+      agrupados[palabraClave] = { desc: palabraClave, total: 0, meses: new Set(), veces: 0 };
+    }
+    
+    agrupados[palabraClave].total += Math.abs(parsearValor(r[7]));
+    agrupados[palabraClave].veces++;
+    agrupados[palabraClave].meses.add(r[1].slice(0, 7)); // YYYY-MM
   }
 
   // Filtrar los que se repiten en al menos 3 meses distintos
@@ -336,7 +345,9 @@ async function handleRecurrentes(env, chatId) {
   let msg = `🔄 <b>Gastos Recurrentes</b> (últimos 4 meses)\n\n`;
   for (const rec of recurrentes) {
     const promedio = rec.total / rec.meses.size;
-    msg += `• <b>${rec.desc}</b> (${rec.veces}x)\n`;
+    // Capitalizar primera letra
+    const nombre = rec.desc.charAt(0).toUpperCase() + rec.desc.slice(1);
+    msg += `• <b>${nombre}</b> (${rec.veces}x)\n`;
     msg += `  Promedio: $${fmt(promedio)}/mes\n`;
   }
   return enviar(env, chatId, msg);
@@ -623,42 +634,9 @@ function mensajeResumen(data) {
 async function handleStart(env, chatId) {
   return enviar(env, chatId,
     `👋 Hola Brayan.\n\n` +
-    `<b>Registrar gasto</b> (sin comandos):\n` +
-    `• <code>5000 almuerzo</code>\n` +
-    `• <code>almuerzo 5000</code>\n` +
-    `• <code>18000 gasolina debito</code>\n\n` +
-    `<b>Consultas:</b>\n` +
-    `/saldo — balance, sueldo y acumulado\n` +
-    `/resumen — el mismo resumen que llega en la mañana\n` +
-    `/mes — resumen por rubro\n` +
-    `/rubro X — detalle de un rubro\n` +
-    `/metodos — desglose por medio de pago\n` +
-    `/tendencia — últimos 4 meses\n` +
-    `/hoy — movimientos de hoy\n` +
-    `/semana — últimos 7 días\n` +
-    `/presupuesto — presupuesto del mes\n` +
-    `/buscar texto — buscar en el historial\n` +
-    `/recurrentes — ver gastos que se repiten\n` +
-    `/grafico — gráfico de gastos del mes\n` +
-    `/listar — últimos 10 movimientos\n` +
-    `/borradores — borradores pendientes\n\n` +
-    `<b>Correos:</b>\n` +
-    `/correos — procesar correos nuevos del banco\n\n` +
-    `<b>Editar:</b>\n` +
-    `/editar ID — modificar el movimiento\n` +
-    `/borrar ID — eliminar el movimiento\n` +
-    `/valor ID 5000 — cambiar el monto\n` +
-    `/desc ID texto — cambiar la descripción\n\n` +
-    `<b>Mantenimiento:</b>\n` +
-    `/recalcular — recalcular saldos históricos\n` +
-    `/revisar — movimientos con rubro "Otro"\n` +
-    `/aprender — cargar aprendizaje del histórico\n` +
-    `/aprendizaje — ver la tabla de aprendizaje\n` +
-    `/testcorreos — cuántos correos hay etiquetados\n` +
-    `/vercorreo — ver el body crudo del último correo\n` +
-    `/testparser — analizar los últimos 10 correos\n` +
-    `/sugerencia — análisis mensual\n\n` +
-    `/ayuda`
+    `Escribe <code>5000 almuerzo</code> para registrar un gasto.\n` +
+    `O usa los botones de abajo para navegar.`,
+    { reply_markup: tecladoMenuPrincipal() } // <-- Los paréntesis son obligatorios aquí
   );
 }
 
@@ -1192,12 +1170,12 @@ async function handleBorradores(env, chatId) {
   return enviar(env, chatId, msg, { reply_markup: tecladoBorradores(borradores) });
 }
 
-async function handleBuscar(env, chatId, busqueda) {
+async function handleBuscar(env, chatId, busqueda, offset = 0, messageId = null) {
   if (!busqueda) {
     return enviar(env, chatId, `❌ Uso: <code>/buscar rappi</code>`);
   }
   const hoy = hoyColombia();
-  const rows = await leerMovimientos(env, '2000-01-01', hoy, true); // busca en todo el historial
+  const rows = await leerMovimientos(env, '2000-01-01', hoy, true);
   const query = busqueda.toLowerCase().trim();
   
   const encontrados = [];
@@ -1214,8 +1192,9 @@ async function handleBuscar(env, chatId, busqueda) {
   }
 
   let msg = `🔍 <b>Resultados para "${busqueda}"</b> (${encontrados.length})\n\n`;
-  // Mostrar los últimos 15
-  const recientes = encontrados.slice(-15).reverse();
+  
+  // Paginación
+  const recientes = encontrados.slice(offset, offset + 10).reverse();
   for (const { data: r } of recientes) {
     const valor = parsearValor(r[7]);
     const signo = valor < 0 ? '➖' : '➕';
@@ -1223,10 +1202,13 @@ async function handleBuscar(env, chatId, busqueda) {
     const id = String(r[0] || '').trim();
     msg += `<b>#${id}</b> ${fecha} ${signo} $${fmt(Math.abs(valor))} — ${r[8] || ''} <i>(${r[6]})</i>\n`;
   }
-  if (encontrados.length > 15) {
-    msg += `\n<i>... y ${encontrados.length - 15} más.</i>`;
+  
+  const teclado = tecladoBuscar(offset, encontrados.length, busqueda);
+
+  if (messageId) {
+    return editarMensaje(env, chatId, messageId, msg, { reply_markup: teclado });
   }
-  return enviar(env, chatId, msg);
+  return enviar(env, chatId, msg, { reply_markup: teclado });
 }
 
 async function handleEditar(env, chatId, idBuscado) {
@@ -1840,7 +1822,9 @@ async function handleCorreosVerIndividual(env, chatId, messageId) {
 
 async function handleGrafico(env, chatId) {
   const hoy = hoyColombia();
+  const año = Number(hoy.slice(0, 4));
   const mesNum = Number(hoy.slice(5, 7));
+  const diaHoy = Number(hoy.slice(8, 10));
   const mesIni = hoy.slice(0, 7) + '-01';
 
   const rows = await leerMovimientos(env, mesIni, hoy, true);
@@ -1851,49 +1835,56 @@ async function handleGrafico(env, chatId) {
     porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(parsearValor(r[7]));
   }
 
-  const datos = Object.entries(porRubro).sort((a, b) => a[1] - b[1]).slice(-7); // Top 7 (de menor a mayor para que la barra más grande quede arriba)
+  const datos = Object.entries(porRubro).sort((a, b) => a[1] - b[1]).slice(-7);
   if (datos.length === 0) return enviar(env, chatId, `📭 No hay gastos este mes.`);
 
   const labels = datos.map(d => d[0]);
   const values = datos.map(d => d[1]);
+
+  const colores = [
+    '#8b5cf6', '#6366f1', '#3b82f6', '#0ea5e9', 
+    '#10b981', '#f59e0b', '#ef4444'
+  ];
+
+  // Función para formatear el dinero (compatible con QuickChart v3)
+  const formatterFn = "function(value) { return '$' + value.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.'); }";
 
   const chartConfig = {
     type: 'bar',
     data: {
       labels: labels,
       datasets: [{
+        label: 'Gastos', // Etiqueta para evitar el "undefined"
         data: values,
-        backgroundColor: [
-          '#a78bfa', '#818cf8', '#60a5fa', '#34d399', 
-          '#fbbf24', '#f87171', '#fb923c'
-        ],
+        backgroundColor: colores.slice(0, datos.length),
         borderRadius: 6
       }]
     },
     options: {
-      indexAxis: 'y', // Hace las barras horizontales
+      indexAxis: 'y', // Barras horizontales
       plugins: {
-        legend: { display: false },
+        legend: { display: false }, // Ocultamos la leyenda
         datalabels: {
           anchor: 'end',
           align: 'right',
-          formatter: (value) => '$' + value.toLocaleString('es-CO'),
-          font: { weight: 'bold' }
+          formatter: formatterFn,
+          font: { weight: 'bold', size: 12, color: '#333' }
         }
       },
       scales: {
         x: { display: false, beginAtZero: true },
-        y: { grid: { display: false } }
+        y: { grid: { display: false }, ticks: { font: { size: 12, weight: 'bold' } } }
       }
     }
   };
 
+  // EL SECRETO ESTÁ AQUÍ: Volvemos a poner el &v=3 al final
   const url = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=600&h=400&bkg=white&v=3`;
   
   return tg(env, 'sendPhoto', {
     chat_id: chatId,
     photo: url,
-    caption: `📊 <b>Gastos de ${MESES[mesNum - 1]} por rubro</b>`,
+    caption: `📊 <b>Gastos de ${MESES[mesNum - 1]} por rubro</b>\n<i>Corte al ${diaHoy}/${mesNum}/${año}</i>`,
     parse_mode: 'HTML'
   });
 }
@@ -1903,10 +1894,25 @@ async function handleGrafico(env, chatId) {
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
+  // --- INTERCEPTAR BOTONES DEL TECLADO PERSISTENTE ---
+  if (texto === '💰 Saldo') return handleSaldo(env, chatId);
+  if (texto === '📊 Resumen') return handleResumen(env, chatId);
+  if (texto === '📅 Hoy') return handleHoy(env, chatId);
+  if (texto === '📈 Gráfico') return handleGrafico(env, chatId);
+  if (texto === '📝 Borradores') return handleBorradores(env, chatId);
+  if (texto === '📧 Correos') return handleCorreos(env, chatId, false);
+  // ---------------------------------------------------
   if (texto.startsWith('/recurrentes')) return handleRecurrentes(env, chatId);
   if (texto.startsWith('/registrarcomandos')) return registrarComandos(env).then(r =>
     enviar(env, chatId, r && r.ok ? '✅ Comandos registrados en Telegram.' : '❌ Error registrando.')
   );
+
+  if (texto.startsWith('/ingreso')) {
+    const resto = texto.replace('/ingreso', '').trim();
+    const parsed = parsearGasto(resto); // Reutilizamos la misma lógica de extraer número y texto
+    if (!parsed) return enviar(env, chatId, '❌ Formato: /ingreso 50000 venta de algo');
+    return handleIngreso(env, chatId, parsed.monto, parsed.desc);
+  }
 
   if (String(chatId) !== String(env.TELEGRAM_CHAT_ID).trim()) {
     return enviar(env, chatId, '⛔ No autorizado.');
@@ -2051,6 +2057,12 @@ async function handleCallback(env, cq) {
     
     await verificarAlertas(env, chatId, rubro);
     return;
+  }
+
+  if (accion === 'buscar_pag') {
+    const query = params[0];
+    const offset = Number(params[1]) || 0;
+    return handleBuscar(env, chatId, query, offset, messageId);
   }
 
   if (accion === 'cancelar') {
@@ -2397,4 +2409,24 @@ async function registrarComandos(env) {
     console.log('[SETMYCOMMANDS] Error:', e.message);
     return null;
   }
+}
+async function handleIngreso(env, chatId, monto, desc) {
+  if (monto > TOPE_VALOR) return enviar(env, chatId, `❌ Monto muy alto.`);
+  const fecha = hoyColombia();
+  
+  await borrarMensajesDeBorradoresViejos(env, chatId);
+  const fila = await appendMovimiento(env, {
+    fecha, rubro: 'Ingreso extra', valor: monto, descripcion: desc, medio: 'Efectivo',
+    tipo: 'Ingreso', fuente: 'manual', estado: 'pendiente',
+  });
+
+  const r = await leerMovimientoPorFila(env, fila);
+  const id = String(r?.[0] || fila).trim();
+  const msgResp = await enviar(env, chatId,
+    `🕒 <b>Borrador Ingreso</b> (ID ${id})\n` +
+    textoBorrador(fecha, 'Ingreso extra', monto, desc, 'Efectivo') +
+    `\n\nPresiona ✅ para guardar:`,
+    { reply_markup: tecladoBorrador(fila) }
+  );
+  if (msgResp?.ok) await guardarMsgId(env, fila, msgResp.result.message_id);
 }
