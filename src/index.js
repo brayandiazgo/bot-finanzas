@@ -671,6 +671,15 @@ async function handleResumen(env, chatId) {
 }
 
 async function handleRegistrar(env, chatId, monto, desc, medio) {
+  
+    if (!desc || desc.trim().length < 3) {
+    return enviar(env, chatId, 
+      `❌ <b>Falta la descripción.</b>\n\n` +
+      `Escribe el monto y para qué fue.\n` +
+      `Ejemplo: <code>5000 almuerzo</code> o <code>gasto 15000 gasolina</code>`
+    );
+  }
+  
   if (monto > TOPE_VALOR) {
     return enviar(env, chatId,
       `❌ El monto supera el tope de <b>$${fmt(TOPE_VALOR)}</b>.\n` +
@@ -1831,7 +1840,6 @@ async function handleCorreosVerIndividual(env, chatId, messageId) {
 
 async function handleGrafico(env, chatId) {
   const hoy = hoyColombia();
-  const año = Number(hoy.slice(0, 4));
   const mesNum = Number(hoy.slice(5, 7));
   const mesIni = hoy.slice(0, 7) + '-01';
 
@@ -1843,26 +1851,45 @@ async function handleGrafico(env, chatId) {
     porRubro[rubro] = (porRubro[rubro] || 0) + Math.abs(parsearValor(r[7]));
   }
 
-  const datos = Object.entries(porRubro).sort((a, b) => b[1] - a[1]).slice(0, 6); // Top 6
+  const datos = Object.entries(porRubro).sort((a, b) => a[1] - b[1]).slice(-7); // Top 7 (de menor a mayor para que la barra más grande quede arriba)
   if (datos.length === 0) return enviar(env, chatId, `📭 No hay gastos este mes.`);
 
   const labels = datos.map(d => d[0]);
   const values = datos.map(d => d[1]);
 
   const chartConfig = {
-    type: 'doughnut',
+    type: 'bar',
     data: {
       labels: labels,
-      datasets: [{ data: values }]
+      datasets: [{
+        data: values,
+        backgroundColor: [
+          '#a78bfa', '#818cf8', '#60a5fa', '#34d399', 
+          '#fbbf24', '#f87171', '#fb923c'
+        ],
+        borderRadius: 6
+      }]
     },
     options: {
-      plugins: { legend: { position: 'bottom' } }
+      indexAxis: 'y', // Hace las barras horizontales
+      plugins: {
+        legend: { display: false },
+        datalabels: {
+          anchor: 'end',
+          align: 'right',
+          formatter: (value) => '$' + value.toLocaleString('es-CO'),
+          font: { weight: 'bold' }
+        }
+      },
+      scales: {
+        x: { display: false, beginAtZero: true },
+        y: { grid: { display: false } }
+      }
     }
   };
 
-  const url = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=600&h=400&bkg=white`;
+  const url = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(chartConfig))}&w=600&h=400&bkg=white&v=3`;
   
-  // Enviar como foto a Telegram
   return tg(env, 'sendPhoto', {
     chat_id: chatId,
     photo: url,

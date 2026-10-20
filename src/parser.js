@@ -145,6 +145,23 @@ export function parsearCorreo(correo) {
   }
 
   // 4. TRANSFERENCIA ENVIADA
+  m = body.match(/Transferiste\s+\$([\d.,]+)\s+por\s+Boton\s+Bancolombia\s+a\s+(.+?)\s+desde\s+producto/i);
+  if (m) {
+    const monto = parsearMonto(m[1]);
+    const destino = m[2].trim();
+    const fecha = parsearFecha(body);
+    return {
+      tipo: 'gasto',
+      monto,
+      descripcion: `Pago ${destino}`,
+      medio: 'Transferencia',
+      fecha,
+      esIngreso: false,
+      esNomina: false,
+      nota: `Botón Bancolombia`,
+    };
+  }
+  
   m = body.match(/Transferiste\s+\$([\d.,]+)\s+desde\s+tu\s+cuenta\s+\*?\d+\s+a\s+la\s+cuenta\s+\*?(\d+)/i);
   if (m) {
     const monto = parsearMonto(m[1]);
