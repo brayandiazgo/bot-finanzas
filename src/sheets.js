@@ -660,6 +660,7 @@ export async function leerSueldoBase(env) {
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       if (!r || !r[0]) continue;
+      // Busca el neto (el que te consignan)
       if (String(r[0]).toLowerCase().includes('neto que te consignan')) {
         const montoStr = String(r[1]).replace(/[$,.\s]/g, '');
         const monto = Number(montoStr);
@@ -668,10 +669,36 @@ export async function leerSueldoBase(env) {
     }
     return 0;
   } catch (e) {
-    console.log('[CONFIG] Error leyendo sueldo:', e.message);
+    console.log('[CONFIG] Error leyendo sueldo base:', e.message);
     return 0;
   }
 }
+
+export async function leerSueldoBasico(env) {
+  try {
+    const data = await sheetsRequest(
+      env,
+      `/values/CONFIG!A:B?valueRenderOption=FORMATTED_VALUE`
+    );
+    const rows = data.values || [];
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r[0]) continue;
+      const etiqueta = String(r[0]).toLowerCase();
+      // Busca el básico (para el diezmo)
+      if (etiqueta.includes('sueldo base') || etiqueta.includes('basico') || etiqueta.includes('básico')) {
+        const montoStr = String(r[1]).replace(/[$,.\s]/g, '');
+        const monto = Number(montoStr);
+        if (!isNaN(monto) && monto > 0) return monto;
+      }
+    }
+    return 0;
+  } catch (e) {
+    console.log('[CONFIG] Error leyendo sueldo basico:', e.message);
+    return 0;
+  }
+}
+
 // Borra todas las filas de SALDOS y las reemplaza por las nuevas
 export async function reemplazarSaldos(env, filas) {
   const meta = await sheetsRequest(env, `?fields=sheets.properties`);

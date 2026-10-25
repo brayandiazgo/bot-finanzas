@@ -27,7 +27,7 @@ import {
   buscarFilaPorId,
   leerAlertasEnviadas, guardarAlerta,
   guardarPresupuesto,
-  leerSaldos, guardarSaldoMes, leerSueldoBase, reemplazarSaldos,
+  leerSaldos, guardarSaldoMes, leerSueldoBase, leerSueldoBasico, reemplazarSaldos,
   leerConfig,
 } from './sheets.js';
 import {
@@ -246,6 +246,63 @@ async function borrarMensajesDeBorradoresViejos(env, chatId) {
   }
 }
 
+/// ----------DIEZMO -----------
+
+async function handleDiezmo(env, chatId) {
+  const hoy = hoyColombia();
+  const mesNum = Number(hoy.slice(5, 7));
+  const mesIni = hoy.slice(0, 7) + '-01';
+
+  const sueldoBasico = await leerSueldoBasico(env);
+  if (sueldoBasico === 0) {
+    return enviar(env, chatId, 
+      `⚠️ No encontré el "Sueldo Base" en tu hoja CONFIG.\n\n` +
+      `Por favor agrega una fila en CONFIG que diga:\n<b>Sueldo Base | 2349095</b>`
+    );
+  }
+
+  const rows = await leerMovimientos(env, mesIni, hoy, true);
+  let ingresosExtra = 0;
+  const detalleExtras = [];
+
+  for (const { data: r } of rows) {
+    if (r[10] !== 'Ingreso') continue;
+    const rubro = r[6] || '';
+    
+    // Ignoramos la nómina (porque el diezmo de la nómina se saca del básico)
+    if (rubro.toLowerCase().includes('salario') || rubro.toLowerCase().includes('nómina')) continue;
+    
+    const valor = parsearValor(r[7]);
+    ingresosExtra += valor;
+    detalleExtras.push({ desc: r[8], monto: valor });
+  }
+
+  const diezmoSueldo = sueldoBasico * 0.10;
+  const diezmoExtras = ingresosExtra * 0.10;
+  const diezmoTotal = diezmoSueldo + diezmoExtras;
+
+  const mesNombre = MESES[mesNum - 1].charAt(0).toUpperCase() + MESES[mesNum - 1].slice(1);
+
+  let msg = `🙏 <b>Cálculo del Diezmo (${mesNombre})</b>\n\n`;
+  
+  msg += `<b>1. Sueldo Base:</b> $${fmt(sueldoBasico)}\n`;
+  msg += `   Diezmo (10%): $${fmt(diezmoSueldo)}\n\n`;
+
+  if (ingresosExtra > 0) {
+    msg += `<b>2. Ingresos Extra:</b> $${fmt(ingresosExtra)}\n`;
+    for (const d of detalleExtras) {
+      msg += `   • ${d.desc}: $${fmt(d.monto)}\n`;
+    }
+    msg += `   Diezmo (10%): $${fmt(diezmoExtras)}\n\n`;
+  }
+
+  msg += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  msg += `<b>Total Diezmo a apartar: $${fmt(diezmoTotal)}</b>\n`;
+  msg += `<i>Calculado sobre tu sueldo básico + ingresos extra reales.</i>`;
+
+  return enviar(env, chatId, msg);
+}
+
 // ---------- ALERTAS ----------
 
 async function verificarAlertas(env, chatId, rubroTocado = null) {
@@ -364,6 +421,9 @@ async function calcularSugerenciaMensual(env) {
   let mesProx = mesHoy + 1;
   if (mesProx > 12) { mesProx = 1; añoProx += 1; }
 
+  const sueldoNeto = await leerSueldoBase(env); 
+  const sueldoBasico = await leerSueldoBasico(env); 
+
   const meses = [];
   for (let i = 0; i < 3; i++) {
     let m = mesHoy - i;
@@ -372,6 +432,7 @@ async function calcularSugerenciaMensual(env) {
     meses.push({ año: y, mes: m });
   }
 
+  // Aquí estaba el error: faltaba declarar 'acumulado'
   const acumulado = {};
   for (const { año, mes } of meses) {
     const mesIni = `${año}-${String(mes).padStart(2, '0')}-01`;
@@ -391,29 +452,55 @@ async function calcularSugerenciaMensual(env) {
 
   const sugerencia = [];
   for (const [rubro, data] of Object.entries(acumulado)) {
-    const n = data.meses.size || 1;
-    const promedio = data.total / n;
-    const sug = Math.round(promedio / 1000) * 1000;
+    let sug = 0;
+    
+    // REGLA ESPECIAL PARA EL DIEZMO
+    if (rubro.toLowerCase() === 'diezmo' || rubro.toLowerCase() === 'diezmos') {
+      const baseCalculo = sueldoBasico > 0 ? sueldoBasico : sueldoNeto;
+      sug = Math.round((baseCalculo * 0.10) / 1000) * 1000;
+    } else {
+      const n = data.meses.size || 1;
+      const promedio = data.total / n;
+      sug = Math.round(promedio / 1000) * 1000;
+    }
+    
     if (sug > 0) sugerencia.push({ rubro, promedio: sug });
   }
 
   sugerencia.sort((a, b) => b.promedio - a.promedio);
-  
+
   const totalSugerido = sugerencia.reduce((a, s) => a + s.promedio, 0);
-  const sueldoBase = await leerSueldoBase(env);
-  const deficit = totalSugerido - sueldoBase;
+  const deficit = totalSugerido - sueldoNeto;
 
-  return { añoProx, mesProx, sugerencia, totalSugerido, sueldoBase, deficit };
+  const presupuestoActual = await leerPresupuestoMes(env, añoHoy, mesHoy);
+  const presupuestoMap = {};
+  for (const p of presupuestoActual) presupuestoMap[p.rubro] = p.monto;
+
+  return { 
+    añoProx, mesProx, sugerencia, totalSugerido, sueldoBase: sueldoNeto, deficit, presupuestoMap 
+  };
 }
-
 function mensajeSugerencia(data) {
   const total = data.sugerencia.reduce((a, s) => a + s.promedio, 0);
+  const mesProxNombre = MESES[data.mesProx - 1].charAt(0).toUpperCase() + MESES[data.mesProx - 1].slice(1);
+  
   let msg = `📊 <b>Análisis mensual</b>\n\n`;
-  msg += `Sugerencia de presupuesto para <b>${MESES[data.mesProx - 1]} ${data.añoProx}</b>\n`;
+  msg += `Sugerencia de presupuesto para <b>${mesProxNombre} ${data.añoProx}</b>\n`;
   msg += `(basado en promedio de los últimos 3 meses)\n\n`;
+  
   for (const s of data.sugerencia) {
-    msg += `• ${s.rubro}: $${fmt(s.promedio)}\n`;
+    const actual = data.presupuestoMap[s.rubro];
+    let comparativa = '';
+    
+    if (actual > 0) {
+      if (s.promedio > actual) comparativa = ` 🔺 (mes actual: $${fmt(actual)})`;
+      else if (s.promedio < actual) comparativa = ` 🔻 (mes actual: $${fmt(actual)})`;
+      else comparativa = ` (= al mes actual)`;
+    }
+    
+    msg += `• ${s.rubro}: $${fmt(s.promedio)}${comparativa}\n`;
   }
+  
   msg += `\n<b>Total: $${fmt(total)}</b>\n`;
   
   if (data.deficit > 0) {
@@ -1452,14 +1539,24 @@ async function handleVerAprendizaje(env, chatId) {
 }
 
 async function handleSugerencia(env, chatId) {
-  await enviar(env, chatId, '📊 Calculando análisis mensual...');
-  const data = await calcularSugerenciaMensual(env);
-  if (data.sugerencia.length === 0) {
-    return enviar(env, chatId, '📭 No hay suficientes datos para sugerir un presupuesto.');
+  await enviar(env, chatId, '📊 Calculando análisis mensual... (puede tardar unos segundos)');
+  try {
+    console.log('[SUGERENCIA] 1. Iniciando cálculo...');
+    const data = await calcularSugerenciaMensual(env);
+    console.log('[SUGERENCIA] 2. Cálculo exitoso. Rubros encontrados:', data.sugerencia.length);
+    
+    if (data.sugerencia.length === 0) {
+      return enviar(env, chatId, '📭 No hay suficientes datos para sugerir un presupuesto.');
+    }
+    
+    return enviar(env, chatId, mensajeSugerencia(data), {
+      reply_markup: tecladoAplicarPresupuesto(data.añoProx, data.mesProx),
+    });
+  } catch (e) {
+    console.log('[SUGERENCIA ERROR]', e.message, e.stack);
+    // Si falla, te lo decimos por Telegram para no depender de wrangler tail
+    return enviar(env, chatId, `❌ <b>Error calculando sugerencia:</b>\n<code>${e.message}</code>`);
   }
-  return enviar(env, chatId, mensajeSugerencia(data), {
-    reply_markup: tecladoAplicarPresupuesto(data.añoProx, data.mesProx),
-  });
 }
 
 function limpiarHTML(html) {
@@ -1891,9 +1988,57 @@ async function handleGrafico(env, chatId) {
 
 // ---------- MANEJO DE MENSAJES ----------
 
+async function handleSetPresupuesto(env, chatId, texto) {
+  const m = texto.match(/^(.+?)\s+([\d.,]+)$/);
+  if (!m) {
+    return enviar(env, chatId, 
+      `❌ Formato incorrecto.\n\nUso: <code>/setpresupuesto [Rubro] [Monto]</code>\nEjemplo: <code>/setpresupuesto Alimentación 450000</code>\n\n(Esto se guardará para el PRÓXIMO mes).`
+    );
+  }
+
+  const busqueda = m[1].trim();
+  const monto = Number(m[2].replace(/[.,]/g, ''));
+
+  if (monto <= 0) return enviar(env, chatId, '❌ El monto debe ser mayor a 0.');
+
+  const busqNorm = normalizar(busqueda);
+  const rubrosNorm = RUBROS_MENU.map(r => ({ original: r, norm: normalizar(r) }));
+  
+  let rubroEncontrado = rubrosNorm.find(r => r.norm === busqNorm);
+  if (!rubroEncontrado) rubroEncontrado = rubrosNorm.find(r => r.norm.startsWith(busqNorm));
+  if (!rubroEncontrado) rubroEncontrado = rubrosNorm.find(r => r.norm.includes(busqNorm));
+
+  if (!rubroEncontrado) {
+    return enviar(env, chatId, `❌ No encontré el rubro "${busqueda}".\nUsa /presupuesto para ver los rubros disponibles.`);
+  }
+
+  // CALCULAMOS EL PRÓXIMO MES
+  const hoy = hoyColombia();
+  const añoHoy = Number(hoy.slice(0, 4));
+  const mesHoy = Number(hoy.slice(5, 7));
+
+  let añoProx = añoHoy;
+  let mesProx = mesHoy + 1;
+  if (mesProx > 12) { mesProx = 1; añoProx += 1; }
+
+  try {
+    await guardarPresupuesto(env, añoProx, mesProx, rubroEncontrado.original, monto);
+    await borrarSaldoCache(env); 
+    
+    const mesNombre = MESES[mesProx - 1].charAt(0).toUpperCase() + MESES[mesProx - 1].slice(1);
+    return enviar(env, chatId, 
+      `✅ Presupuesto actualizado para <b>${mesNombre} ${añoProx}</b>:\n\n<b>${rubroEncontrado.original}</b> → $${fmt(monto)}\n\nEl presupuesto de este mes no se ha tocado.`
+    );
+  } catch (e) {
+    console.log('[SETPRESUPUESTO] Error:', e.message);
+    return enviar(env, chatId, `❌ Error guardando en el Sheet: ${e.message}`);
+  }
+}
+
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
+  
   // --- INTERCEPTAR BOTONES DEL TECLADO PERSISTENTE ---
   if (texto === '💰 Saldo') return handleSaldo(env, chatId);
   if (texto === '📊 Resumen') return handleResumen(env, chatId);
@@ -1902,17 +2047,11 @@ async function handleMensaje(env, msg) {
   if (texto === '📝 Borradores') return handleBorradores(env, chatId);
   if (texto === '📧 Correos') return handleCorreos(env, chatId, false);
   // ---------------------------------------------------
+
   if (texto.startsWith('/recurrentes')) return handleRecurrentes(env, chatId);
   if (texto.startsWith('/registrarcomandos')) return registrarComandos(env).then(r =>
     enviar(env, chatId, r && r.ok ? '✅ Comandos registrados en Telegram.' : '❌ Error registrando.')
   );
-
-  if (texto.startsWith('/ingreso')) {
-    const resto = texto.replace('/ingreso', '').trim();
-    const parsed = parsearGasto(resto); // Reutilizamos la misma lógica de extraer número y texto
-    if (!parsed) return enviar(env, chatId, '❌ Formato: /ingreso 50000 venta de algo');
-    return handleIngreso(env, chatId, parsed.monto, parsed.desc);
-  }
 
   if (String(chatId) !== String(env.TELEGRAM_CHAT_ID).trim()) {
     return enviar(env, chatId, '⛔ No autorizado.');
@@ -1984,6 +2123,22 @@ async function handleMensaje(env, msg) {
     const { medio, desc } = extraerMedio(parsed.desc);
     return handleRegistrar(env, chatId, parsed.monto, desc, medio);
   }
+
+  // --- NUEVOS COMANDOS ---
+  if (texto.startsWith('/setpresupuesto')) {
+    const resto = texto.replace('/setpresupuesto', '').trim();
+    return handleSetPresupuesto(env, chatId, resto);
+  }
+
+  if (texto.startsWith('/ingreso')) {
+    const resto = texto.replace('/ingreso', '').trim();
+    const parsed = parsearGasto(resto);
+    if (!parsed) return enviar(env, chatId, '❌ Formato: /ingreso 50000 venta de algo');
+    return handleIngreso(env, chatId, parsed.monto, parsed.desc);
+  }
+
+  if (texto.startsWith('/diezmo')) return handleDiezmo(env, chatId);
+  // -----------------------
 
   if (!texto.startsWith('/')) {
     const parsed = parsearGasto(texto);
@@ -2390,6 +2545,8 @@ async function registrarComandos(env) {
     { command: 'valor',        description: 'Cambiar el monto de un movimiento' },
     { command: 'desc',         description: 'Cambiar la descripción' },
     { command: 'gasto',        description: 'Registrar gasto con /gasto' },
+    { command: 'ingreso',      description: 'Registrar un ingreso manual' },
+    { command: 'setpresupuesto', description: 'Editar el monto de un rubro' },
     { command: 'revisar',      description: 'Revisar rubros "Otro"' },
     { command: 'aprender',     description: 'Cargar aprendizaje' },
     { command: 'aprendizaje',  description: 'Ver tabla de aprendizaje' },
@@ -2400,6 +2557,7 @@ async function registrarComandos(env) {
     { command: 'buscar',       description: 'Buscar en el historial' },
     { command: 'recurrentes',  description: 'Ver gastos recurrentes' },
     { command: 'grafico',      description: 'Gráfico del mes' },
+    { command: 'diezmo',       description: 'Calcular el 10% de los ingresos del mes' },
   ];
   try {
     const res = await tg(env, 'setMyCommands', { commands: comandos });
@@ -2409,24 +2567,4 @@ async function registrarComandos(env) {
     console.log('[SETMYCOMMANDS] Error:', e.message);
     return null;
   }
-}
-async function handleIngreso(env, chatId, monto, desc) {
-  if (monto > TOPE_VALOR) return enviar(env, chatId, `❌ Monto muy alto.`);
-  const fecha = hoyColombia();
-  
-  await borrarMensajesDeBorradoresViejos(env, chatId);
-  const fila = await appendMovimiento(env, {
-    fecha, rubro: 'Ingreso extra', valor: monto, descripcion: desc, medio: 'Efectivo',
-    tipo: 'Ingreso', fuente: 'manual', estado: 'pendiente',
-  });
-
-  const r = await leerMovimientoPorFila(env, fila);
-  const id = String(r?.[0] || fila).trim();
-  const msgResp = await enviar(env, chatId,
-    `🕒 <b>Borrador Ingreso</b> (ID ${id})\n` +
-    textoBorrador(fecha, 'Ingreso extra', monto, desc, 'Efectivo') +
-    `\n\nPresiona ✅ para guardar:`,
-    { reply_markup: tecladoBorrador(fila) }
-  );
-  if (msgResp?.ok) await guardarMsgId(env, fila, msgResp.result.message_id);
 }
