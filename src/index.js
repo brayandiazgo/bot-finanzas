@@ -67,6 +67,15 @@ const RUBROS_MENU = [
   'Donacion', 'Mantenimiento vehicular', 'Otro',
 ];
 
+const RUBROS_BLINDADOS = [
+  'Casa', 
+  'Prestamo', 
+  'Recibos',  
+  'Gasolina',
+  'Trading',
+  'Entretenimiento'
+];
+
 function categorizarBasico(texto) {
   const t = texto.toLowerCase();
   const matches = [];
@@ -411,7 +420,6 @@ async function handleRecurrentes(env, chatId) {
 }
 
 // ---------- ANÁLISIS MENSUAL ----------
-
 async function calcularSugerenciaMensual(env) {
   const hoy = hoyColombia();
   const añoHoy = Number(hoy.slice(0, 4));
@@ -424,6 +432,16 @@ async function calcularSugerenciaMensual(env) {
   const sueldoNeto = await leerSueldoBase(env); 
   const sueldoBasico = await leerSueldoBasico(env); 
 
+  // 1. Leer presupuesto del mes ACTUAL
+  const presupuestoActual = await leerPresupuestoMes(env, añoHoy, mesHoy);
+  const presupuestoMapActual = {};
+  for (const p of presupuestoActual) presupuestoMapActual[p.rubro] = p.monto;
+
+  // 2. Leer presupuesto del PRÓXIMO MES (tus ediciones con /setpresupuesto)
+  const presupuestoProx = await leerPresupuestoMes(env, añoProx, mesProx);
+  const presupuestoMapProx = {};
+  for (const p of presupuestoProx) presupuestoMapProx[p.rubro] = p.monto;
+
   const meses = [];
   for (let i = 0; i < 3; i++) {
     let m = mesHoy - i;
@@ -432,7 +450,6 @@ async function calcularSugerenciaMensual(env) {
     meses.push({ año: y, mes: m });
   }
 
-  // Aquí estaba el error: faltaba declarar 'acumulado'
   const acumulado = {};
   for (const { año, mes } of meses) {
     const mesIni = `${año}-${String(mes).padStart(2, '0')}-01`;
@@ -451,20 +468,65 @@ async function calcularSugerenciaMensual(env) {
   }
 
   const sugerencia = [];
-  for (const [rubro, data] of Object.entries(acumulado)) {
-    let sug = 0;
+  let totalBlindado = 0;
+  let totalFlexibleHistorico = 0;
+  let diezmoSugerido = 0;
+  const rubrosFlexibles = [];
+
+  // Unimos todos los rubros: históricos + blindados + los que editaste para el próximo mes
+  const todosLosRubros = new Set([
+    ...Object.keys(acumulado),
+    ...Object.keys(presupuestoMapProx),
+    ...RUBROS_BLINDADOS
+  ]);
+
+  for (const rubro of todosLosRubros) {
+    const data = acumulado[rubro] || { total: 0, meses: new Set() };
+    const n = data.meses.size || 1;
+    const promedio = Math.round((data.total / n) / 1000) * 1000;
     
-    // REGLA ESPECIAL PARA EL DIEZMO
     if (rubro.toLowerCase() === 'diezmo' || rubro.toLowerCase() === 'diezmos') {
       const baseCalculo = sueldoBasico > 0 ? sueldoBasico : sueldoNeto;
-      sug = Math.round((baseCalculo * 0.10) / 1000) * 1000;
+      diezmoSugerido = Math.round((baseCalculo * 0.10) / 1000) * 1000;
+      sugerencia.push({ rubro, promedio: diezmoSugerido, esBlindado: true, esDiezmo: true });
+    } 
+    // Si lo editaste manualmente para el próximo mes, O es un rubro blindado
+    else if (presupuestoMapProx[rubro] > 0 || RUBROS_BLINDADOS.includes(rubro)) {
+      let montoFijo = 0;
+      if (presupuestoMapProx[rubro] > 0) {
+        montoFijo = presupuestoMapProx[rubro]; // Respetamos tu edición manual
+      } else if (presupuestoMapActual[rubro] > 0) {
+        montoFijo = presupuestoMapActual[rubro]; // Usamos el del mes actual
+      } else {
+        montoFijo = promedio; // Fallback al histórico
+      }
+      totalBlindado += montoFijo;
+      sugerencia.push({ rubro, promedio: montoFijo, esBlindado: true });
     } else {
-      const n = data.meses.size || 1;
-      const promedio = data.total / n;
-      sug = Math.round(promedio / 1000) * 1000;
+      if (promedio > 0) {
+        totalFlexibleHistorico += promedio;
+        rubrosFlexibles.push({ rubro, promedioHistorico: promedio });
+      }
     }
+  }
+
+  const disponibleParaFlexibles = sueldoNeto - totalBlindado - diezmoSugerido;
+
+  if (rubrosFlexibles.length > 0 && totalFlexibleHistorico > 0) {
+    const factor = disponibleParaFlexibles > 0 ? (disponibleParaFlexibles / totalFlexibleHistorico) : 0;
     
-    if (sug > 0) sugerencia.push({ rubro, promedio: sug });
+    for (const f of rubrosFlexibles) {
+      let nuevoMonto = Math.round((f.promedioHistorico * factor) / 1000) * 1000;
+      if (nuevoMonto < 0) nuevoMonto = 0;
+      
+      sugerencia.push({ 
+        rubro: f.rubro, 
+        promedio: nuevoMonto, 
+        esBlindado: false, 
+        ajustado: nuevoMonto < f.promedioHistorico,
+        original: f.promedioHistorico
+      });
+    }
   }
 
   sugerencia.sort((a, b) => b.promedio - a.promedio);
@@ -472,41 +534,46 @@ async function calcularSugerenciaMensual(env) {
   const totalSugerido = sugerencia.reduce((a, s) => a + s.promedio, 0);
   const deficit = totalSugerido - sueldoNeto;
 
-  const presupuestoActual = await leerPresupuestoMes(env, añoHoy, mesHoy);
-  const presupuestoMap = {};
-  for (const p of presupuestoActual) presupuestoMap[p.rubro] = p.monto;
-
   return { 
-    añoProx, mesProx, sugerencia, totalSugerido, sueldoBase: sueldoNeto, deficit, presupuestoMap 
+    añoProx, mesProx, sugerencia, totalSugerido, sueldoBase: sueldoNeto, deficit, presupuestoMap: presupuestoMapActual 
   };
 }
 function mensajeSugerencia(data) {
   const total = data.sugerencia.reduce((a, s) => a + s.promedio, 0);
   const mesProxNombre = MESES[data.mesProx - 1].charAt(0).toUpperCase() + MESES[data.mesProx - 1].slice(1);
   
-  let msg = `📊 <b>Análisis mensual</b>\n\n`;
-  msg += `Sugerencia de presupuesto para <b>${mesProxNombre} ${data.añoProx}</b>\n`;
-  msg += `(basado en promedio de los últimos 3 meses)\n\n`;
+  let msg = `📊 <b>Análisis mensual ajustado</b>\n\n`;
+  msg += `Sugerencia para <b>${mesProxNombre} ${data.añoProx}</b>\n`;
+  msg += `(Ajustado a tu sueldo neto: $${fmt(data.sueldoBase)})\n\n`;
   
   for (const s of data.sugerencia) {
     const actual = data.presupuestoMap[s.rubro];
     let comparativa = '';
     
     if (actual > 0) {
-      if (s.promedio > actual) comparativa = ` 🔺 (mes actual: $${fmt(actual)})`;
-      else if (s.promedio < actual) comparativa = ` 🔻 (mes actual: $${fmt(actual)})`;
-      else comparativa = ` (= al mes actual)`;
+      if (s.promedio > actual) comparativa = ` 🔺`;
+      else if (s.promedio < actual) comparativa = ` 🔻`;
+      else comparativa = ` (=)`;
     }
-    
-    msg += `• ${s.rubro}: $${fmt(s.promedio)}${comparativa}\n`;
+
+    if (s.esDiezmo) {
+      msg += `🙏 <b>${s.rubro}</b>: $${fmt(s.promedio)} 🔒 (10% del básico)\n`;
+    } else if (s.esBlindado) {
+      msg += `🔒 <b>${s.rubro}</b>: $${fmt(s.promedio)}${comparativa} (Fijo)\n`;
+    } else if (s.ajustado) {
+      // Mostramos que se recortó
+      msg += `✂️ <b>${s.rubro}</b>: $${fmt(s.promedio)}${comparativa} <i>(ajustado de $${fmt(s.original)})</i>\n`;
+    } else {
+      msg += `🔹 <b>${s.rubro}</b>: $${fmt(s.promedio)}${comparativa}\n`;
+    }
   }
   
-  msg += `\n<b>Total: $${fmt(total)}</b>\n`;
+  msg += `\n<b>Total Presupuestado: $${fmt(total)}</b>\n`;
   
   if (data.deficit > 0) {
-    msg += `\n⚠️ <b>Atención:</b> Estás presupuestando $${fmt(data.deficit)} más de tu sueldo base ($${fmt(data.sueldoBase)}).\nAjusta los rubros para no arrancar en déficit.`;
-  } else if (data.deficit <= 0) {
-    msg += `\n✅ <b>Bien:</b> Te quedan $${fmt(Math.abs(data.deficit))} de margen bajo tu sueldo base.`;
+    msg += `\n⚠️ <b>Ojo:</b> Incluso apretando los gastos, te pasas por $${fmt(data.deficit)}. Tendrás que recortar de los rubros fijos o buscar un ingreso extra.`;
+  } else {
+    msg += `\n✅ <b>¡Perfecto!</b> Este presupuesto se ajusta a tu sueldo neto. Te quedan $${fmt(Math.abs(data.deficit))} de margen.`;
   }
   return msg;
 }
@@ -1842,6 +1909,71 @@ async function handleCorreos(env, chatId, silencioso = false) {
   }
 }
 
+async function handleRevisarCorreos(env, chatId) {
+  await enviar(env, chatId, '🔍 Auditando los últimos 15 correos para ver qué pasó con cada uno...');
+  
+  try {
+    const idsExistentes = await leerIdsCorreosExistentes(env);
+    const listaGmail = await listarCorreosBancolombia(env, 15);
+    
+    if (listaGmail.length === 0) {
+      return enviar(env, chatId, '📭 No hay correos etiquetados en Gmail.');
+    }
+
+    let msg = `📧 <b>Auditoría de Correos</b>\n(Últimos ${listaGmail.length} correos)\n\n`;
+    const hoyMs = Date.now();
+    
+    for (const m of listaGmail) {
+      try {
+        const correo = await leerCorreo(env, m.id);
+        const asunto = (correo.asunto || '').slice(0, 30);
+        const parsed = parsearCorreo(correo);
+        
+        let estado = '';
+        let emoji = '';
+        
+        // 1. Verificar si ya está en la hoja de cálculo
+        if (idsExistentes.has(String(m.id).trim())) {
+           emoji = '✅';
+           estado = 'Ya registrado en el Sheet';
+        } 
+        // 2. Verificar si es muy viejo
+        else if (correo.fecha) {
+           const fechaMs = Date.parse(correo.fecha);
+           const dias = Math.floor((hoyMs - fechaMs) / (1000 * 60 * 60 * 24));
+           if (dias > 5) {
+              emoji = '🕒';
+              estado = `Ignorado por viejo (hace ${dias} días)`;
+           } else if (parsed) {
+              emoji = '📝';
+              estado = `Pendiente (${parsed.tipo} $${fmt(parsed.monto)} - ${parsed.descripcion})`;
+           } else {
+              emoji = '❌';
+              estado = 'No reconocido por el parser (texto no coincide)';
+           }
+        } else {
+           emoji = '❓';
+           estado = 'Error: sin fecha detectada';
+        }
+        
+        msg += `${emoji} <b>${asunto}</b>\n`;
+        msg += `   ↳ ${estado}\n\n`;
+        
+      } catch (e) {
+        msg += `⚠️ Error leyendo correo ID ${m.id}\n\n`;
+      }
+    }
+    
+    if (msg.length > 4000) {
+      msg = msg.slice(0, 4000) + '\n...[cortado por longitud]';
+    }
+    
+    return enviar(env, chatId, msg);
+  } catch (e) {
+    return enviar(env, chatId, `❌ Error general: ${e.message}`);
+  }
+}
+
 async function handleCorreosConfirmarTodos(env, chatId, messageId) {
   try {
     const borradores = await listarBorradoresDeCorreo(env);
@@ -1872,12 +2004,17 @@ async function handleCorreosIgnorarTodos(env, chatId, messageId) {
   try {
     const borradores = await listarBorradoresDeCorreo(env);
     let count = 0;
-    for (const { fila } of borradores) {
-      try {
-        await borrarFila(env, fila);
-        count++;
-      } catch (e) { /* noop */ }
+    for (const { data: r } of borradores) {
+      const idBuscado = String(r[0] || '').trim();
+      const filaReal = await buscarFilaPorId(env, idBuscado);
+      if (filaReal) {
+        try {
+          await borrarFila(env, filaReal);
+          count++;
+        } catch (e) { /* noop */ }
+      }
     }
+    await borrarSaldoCache(env); // Limpiamos memoria
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `❌ Ignorados ${count} correo(s).`);
   } catch (e) {
@@ -2035,6 +2172,42 @@ async function handleSetPresupuesto(env, chatId, texto) {
   }
 }
 
+async function handleIngreso(env, chatId, monto, desc) {
+  if (!desc || desc.trim().length < 3) {
+    return enviar(env, chatId, 
+      `❌ <b>Falta la descripción.</b>\n\nEjemplo: <code>/ingreso 50000 Venta de computador</code>`
+    );
+  }
+  
+  if (monto > TOPE_VALOR) {
+    return enviar(env, chatId, `❌ El monto supera el tope de <b>$${fmt(TOPE_VALOR)}</b>.`);
+  }
+
+  const fecha = hoyColombia();
+
+  await borrarMensajesDeBorradoresViejos(env, chatId);
+
+  const fila = await appendMovimiento(env, {
+    fecha, rubro: 'Ingreso extra', valor: monto, descripcion: desc, medio: 'Efectivo',
+    tipo: 'Ingreso', fuente: 'manual', estado: 'pendiente',
+  });
+
+  const r = await leerMovimientoPorFila(env, fila);
+  const id = String(r?.[0] || fila).trim();
+
+  const msgResp = await enviar(env, chatId,
+    `🕒 <b>Borrador de Ingreso</b> (ID ${id})\n` +
+    textoBorrador(fecha, 'Ingreso extra', monto, desc, 'Efectivo') +
+    `\n\nPresiona ✅ para guardar:`,
+    { reply_markup: tecladoBorrador(fila) }
+  );
+
+  if (msgResp && msgResp.ok && msgResp.result) {
+    try { await guardarMsgId(env, fila, msgResp.result.message_id); } catch (e) { /* noop */ }
+  }
+  return msgResp;
+}
+
 async function handleMensaje(env, msg) {
   const chatId = msg.chat.id;
   const texto = (msg.text || '').trim();
@@ -2057,6 +2230,7 @@ async function handleMensaje(env, msg) {
     return enviar(env, chatId, '⛔ No autorizado.');
   }
 
+  if (texto.startsWith('/revisarcorreos')) return handleRevisarCorreos(env, chatId);
   if (texto.startsWith('/start') || texto.startsWith('/ayuda')) return handleStart(env, chatId);
   if (texto.startsWith('/saldo')) return handleSaldo(env, chatId);
   if (texto.startsWith('/resumen')) return handleResumen(env, chatId);
@@ -2184,6 +2358,7 @@ async function handleCallback(env, cq) {
     }
     return;
   }
+
   if (accion === 'ok') {
     const fila = Number(params[0]);
     const rAntes = await leerMovimientoPorFila(env, fila);
@@ -2195,6 +2370,7 @@ async function handleCallback(env, cq) {
     }
     
     await actualizarEstado(env, fila, 'confirmado');
+    await borrarSaldoCache(env); // <--- ESTA ES LA LÍNEA MÁGICA
     try { await limpiarMsgId(env, fila); } catch (e) { /* noop */ }
     
     const r = await leerMovimientoPorFila(env, fila);
@@ -2221,10 +2397,14 @@ async function handleCallback(env, cq) {
   }
 
   if (accion === 'cancelar') {
-    const fila = Number(params[0]);
-    try { await borrarFila(env, fila); } catch (e) { /* noop */ }
-    await actualizarEstado(env, fila, 'confirmado');
-    await borrarSaldoCache(env); //
+    const idBuscado = params[0];
+    // Buscamos en qué fila REAL está el ID, para no borrar la equivocada
+    const filaReal = await buscarFilaPorId(env, idBuscado); 
+    
+    if (filaReal) {
+      try { await borrarFila(env, filaReal); } catch (e) { /* noop */ }
+      await borrarSaldoCache(env); // Limpiamos memoria
+    }
     try { await borrarMensaje(env, chatId, messageId); } catch (e) { /* noop */ }
     return enviar(env, chatId, `🗑️ Cancelado`);
   }
@@ -2558,6 +2738,7 @@ async function registrarComandos(env) {
     { command: 'recurrentes',  description: 'Ver gastos recurrentes' },
     { command: 'grafico',      description: 'Gráfico del mes' },
     { command: 'diezmo',       description: 'Calcular el 10% de los ingresos del mes' },
+    { command: 'revisarcorreos', description: 'Auditar qué pasó con los últimos correos' },
   ];
   try {
     const res = await tg(env, 'setMyCommands', { commands: comandos });

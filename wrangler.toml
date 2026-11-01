@@ -9,7 +9,7 @@ TZ = "America/Bogota"
 
 [triggers]
 crons = [
-  "0 11 * * *",       # 6:00 AM Colombia → resumen AM
+  "0 11 * * *",       # 6:00 AM Colombia → resumen AM (+ reporte semanal si es lunes)
   "0 23 * * *",       # 6:00 PM Colombia → correos (silencioso)
   "0 12 1 * *",       # 7:00 AM día 1 → reservado
   "0 23 28-31 * *",   # 6:00 PM últimos días → análisis mensual
@@ -19,3 +19,6 @@ crons = [
 [[kv_namespaces]]
 binding = "BOT_KV"
 id = "32d089623c4b4c48ba0e2196c8a6e123"
+
+[observability]
+enabled = true

@@ -139,7 +139,7 @@ export function tecladoBorradores(filas) {
     botones.push([
       { text: `✅ #${idMostrar}`, callback_data: `ok:${b.fila}` },
       { text: `✏️ #${idMostrar}`, callback_data: `volver:${b.fila}` },
-      { text: `🗑️ #${idMostrar}`, callback_data: `cancelar:${b.fila}` },
+      { text: `🗑️ #${idMostrar}`, callback_data: `cancelar:${idMostrar}` }, // <-- Envía el ID real
     ]);
   }
   return { inline_keyboard: botones };

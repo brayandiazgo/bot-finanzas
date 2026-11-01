@@ -252,5 +252,23 @@ export function parsearCorreo(correo) {
     };
   }
 
+  // 9. PAGO FACTURA PROGRAMADA (ENEL, EP$A, etc)
+  m = body.match(/Bancolombia informa pago Factura Programada\s+(.+?)\s+Ref\s+\d+\s+por\s+\$([\d.,]+)/i);
+  if (m) {
+    const servicio = m[1].trim();
+    const monto = parsearMonto(m[2]);
+    const fecha = parsearFecha(body);
+    return {
+      tipo: 'gasto',
+      monto,
+      descripcion: `Factura ${servicio}`, // Ej: Factura ENEL
+      medio: 'Debito',
+      fecha,
+      esIngreso: false,
+      esNomina: false,
+      nota: `Pago programado automático`,
+    };
+  }
+
   return null;
 }
