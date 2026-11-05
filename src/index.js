@@ -1637,6 +1637,12 @@ function limpiarHTML(html) {
     .replace(/&gt;/g, '>')
     .replace(/\[https?:\/\/[^\]]+\]/g, '')
     .replace(/\s+/g, ' ')
+    .replace(/&iexcl;/g, '¡').replace(/&iquest;/g, '¿')
+    .replace(/&aacute;/g, 'á').replace(/&eacute;/g, 'é')
+    .replace(/&iacute;/g, 'í').replace(/&oacute;/g, 'ó')
+    .replace(/&uacute;/g, 'ú').replace(/&ntilde;/g, 'ñ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
     .trim();
 }
 
@@ -2563,14 +2569,12 @@ async function handleCallback(env, cq) {
   }
 
   if (accion === 'correos_confirmar_todos') {
-    await actualizarEstado(env, fila, 'confirmado');
     await borrarSaldoCache(env); // 
     return handleCorreosConfirmarTodos(env, chatId, messageId);
  
   }
 
   if (accion === 'correos_ignorar_todos') {
-    await actualizarEstado(env, fila, 'confirmado');
     await borrarSaldoCache(env); // 
     return handleCorreosIgnorarTodos(env, chatId, messageId);
     

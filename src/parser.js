@@ -197,24 +197,24 @@ export function parsearCorreo(correo) {
     };
   }
 
-  // 6. TRANSFERENCIA A LLAVE
-  m = body.match(/transferiste\s+\$([\d.,]+)\s+a\s+la\s+llave\s+(\d+)\s+desde\s+tu\s+cuenta\s+\*?\d+\s+a\s+([A-ZÁÉÍÓÚÑ\s]+?)\s+el/i);
-  if (m) {
-    const monto = parsearMonto(m[1]);
-    const llave = m[2];
-    const nombre = m[3].trim();
-    const fecha = parsearFecha(body);
-    return {
-      tipo: 'gasto',
-      monto,
-      descripcion: `Transferencia a ${nombre}`,
-      medio: 'Transferencia',
-      fecha,
-      esIngreso: false,
-      esNomina: false,
-      nota: `Transferencia a llave ${llave.slice(-4)}`,
-    };
-  }
+// 6. TRANSFERENCIA A LLAVE (Bre-b: llaves numéricas Y alfanuméricas como @jfp214)
+m = body.match(/transferiste\s+\$([\d.,]+)\s+a\s+la\s+llave\s+([\w.@+-]+)\s+desde\s+tu\s+cuenta\s+\*?\d+\s+a\s+([A-Za-zÁÉÍÓÚÑáéíóúñ\s]+?)\s+el/i);
+if (m) {
+  const monto = parsearMonto(m[1]);
+  const llave = m[2];
+  const nombre = m[3].trim();
+  const fecha = parsearFecha(body);
+  return {
+    tipo: 'gasto',
+    monto,
+    descripcion: `Transferencia a ${nombre} (${llave})`,
+    medio: 'Transferencia',
+    fecha,
+    esIngreso: false,
+    esNomina: false,
+    nota: `Transferencia Bre-b a llave ${llave}`,
+  };
+}
 
   // 7. TRANSFERENCIA ENVIADA (formato viejo)
   m = body.match(/Enviaste\s+\$([\d.,]+)\s+a\s+(.+?)\s+(?:desde|el)/i);
